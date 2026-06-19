@@ -582,6 +582,7 @@ lean prompt from KIND, FILE, DIFF, and USER-REQUEST instead of PROMPT."
                 :buffer process-buffer
                 :command command
                 :connection-type 'pipe
+                :coding 'utf-8
                 :noquery t
                 :sentinel
                 (lambda (proc event)
@@ -871,13 +872,17 @@ buffer file.  DIFF and USER-REQUEST are included when present."
         (goto-char (point-min))))))
 
 (defun codetutor--display-panel (root)
-  "Display and return the side-panel buffer for ROOT."
+  "Display and return the side-panel buffer for ROOT.
+
+When the panel is already visible (for example in the spec workbench's bottom
+window) it is reused rather than opened a second time in a side window."
   (let ((buffer (codetutor--panel-buffer root)))
-    (display-buffer-in-side-window
-     buffer
-     `((side . right)
-       (slot . 1)
-       (window-width . ,(codetutor--window-width))))
+    (unless (get-buffer-window buffer)
+      (display-buffer-in-side-window
+       buffer
+       `((side . right)
+         (slot . 1)
+         (window-width . ,(codetutor--window-width)))))
     buffer))
 
 (defun codetutor--append (buffer text)
@@ -1581,6 +1586,7 @@ task, the current-file outline, the diff (on save), and the file index."
             :name "codetutor"
             :buffer process-buffer
             :connection-type 'pipe
+            :coding 'utf-8
             :noquery t
             :command (list codetutor-fireworks-command
                            "--silent" "--show-error" "--fail-with-body"
@@ -1699,16 +1705,21 @@ task, the current-file outline, the diff (on save), and the file index."
     ""))
 
 (defun codetutor--read-file (file max-bytes)
-  "Read at most MAX-BYTES from FILE as a string."
+  "Read at most MAX-BYTES from FILE as a UTF-8 string.
+
+The byte range is read literally (so MAX-BYTES stays byte-accurate) and then
+decoded as UTF-8, so multibyte characters are not left as raw bytes."
   (with-temp-buffer
+    (set-buffer-multibyte nil)
     (let* ((size (file-attribute-size (file-attributes file)))
            (end (when (and (integerp max-bytes)
                            size
                            (< max-bytes size))
-                  max-bytes))
-           (coding-system-for-read 'utf-8))
+                  max-bytes)))
       (insert-file-contents-literally file nil 0 end))
-    (buffer-substring-no-properties (point-min) (point-max))))
+    (decode-coding-string
+     (buffer-substring-no-properties (point-min) (point-max))
+     'utf-8)))
 
 (defun codetutor--read-file-section (root file max-bytes)
   "Read FILE as a labeled context section relative to ROOT."
@@ -2226,15 +2237,21 @@ spec is active, otherwise `save'."
 
 (defun codetutor--display-spec-layout (root spec-file)
   "Show SPEC-FILE in the main window and the tutor panel below it for ROOT."
-  (delete-other-windows)
-  (let ((spec-buffer (find-file-noselect spec-file)))
-    (switch-to-buffer spec-buffer)
-    (display-buffer-in-side-window
-     (codetutor--panel-buffer root)
-     `((side . bottom)
-       (slot . 1)
-       (window-height . ,(codetutor--spec-window-height))))
-    spec-buffer))
+  (let ((panel (codetutor--panel-buffer root)))
+    ;; Close any window already showing the panel (e.g. the right side window
+    ;; from a prior request) so the workbench has exactly one panel window.
+    (dolist (win (get-buffer-window-list panel nil t))
+      (when (window-live-p win)
+        (ignore-errors (delete-window win))))
+    (delete-other-windows)
+    (let ((spec-buffer (find-file-noselect spec-file)))
+      (switch-to-buffer spec-buffer)
+      (display-buffer-in-side-window
+       panel
+       `((side . bottom)
+         (slot . 1)
+         (window-height . ,(codetutor--spec-window-height))))
+      spec-buffer)))
 
 (defun codetutor--spec-kickoff (root)
   "Start a proactive spec-writing interview for ROOT."
