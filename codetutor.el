@@ -120,6 +120,14 @@ answer without further tools."
   "Maximum number of bytes returned to the model from a single tool call."
   :type 'integer)
 
+(defcustom codetutor-cache-tool-results t
+  "Whether the project symbol table is cached until project files change.
+
+When non-nil, `project_symbol_table' reuses its cached tree-sitter parse while
+the project's file modification times are unchanged, rebuilding only when a
+file changes.  Set to nil to always rebuild."
+  :type 'boolean)
+
 (defcustom codetutor-symbol-table-max-files 400
   "Maximum number of project files scanned for the project symbol table."
   :type 'integer)
@@ -245,6 +253,10 @@ An integer is a number of lines; a float is a fraction of the frame height."
 (defcustom codetutor-spec-kickoff t
   "Whether opening a new spec starts a proactive tutoring interview."
   :type 'boolean)
+
+(defcustom codetutor-scratch-max-bytes 8000
+  "Maximum bytes of the CodeTutor scratch buffer pinned into each prompt."
+  :type 'integer)
 
 (defcustom codetutor-memory-file ".codetutor/ARCHITECTURE.md"
   "Project-relative file where CodeTutor stores durable architecture notes."
@@ -387,6 +399,7 @@ An integer is a number of lines; a float is a fraction of the frame height."
     (define-key map (kbd "C-c t m") #'codetutor-refresh-architecture-memory)
     (define-key map (kbd "C-c t s") #'codetutor-new-spec)
     (define-key map (kbd "C-c t S") #'codetutor-open-spec)
+    (define-key map (kbd "C-c t t") #'codetutor-scratch)
     map)
   "Keymap used by `codetutor-mode'.")
 
@@ -714,8 +727,8 @@ buffer file.  DIFF and USER-REQUEST are included when present."
          (file-index (codetutor--project-file-index project-root))
          (spec-context (codetutor--spec-context
                         project-root (when (eq kind 'spec) diff)))
-         (spec-instruction (when (memq kind '(spec spec-implement))
-                             (codetutor--spec-instruction kind)))
+         (posture-instruction (codetutor--kind-instruction kind))
+         (pinned-context (codetutor--pinned-context project-root))
          (diff-text (when diff
                       (codetutor--truncate diff codetutor-max-diff-bytes))))
     (string-join
@@ -727,11 +740,13 @@ buffer file.  DIFF and USER-REQUEST are included when present."
        (format "PROJECT ROOT:\n%s" project-root)
        (when user-request
          (format "USER REQUEST:\n%s" user-request))
+       (when pinned-context
+         (format "PINNED CONTEXT (always included while open):\n\n%s" pinned-context))
        (when conversation-context
          (format "RECENT CONVERSATION:\n%s" conversation-context))
        (when spec-context
          (format "SPEC STATUS:\n%s" spec-context))
-       spec-instruction
+       posture-instruction
        "OPERATING RULES FOR THIS REQUEST:
 - You may inspect/search project files if the backend gives you read-only tools.
 - Treat PROJECT.md/Project.md/project.md and spec/ as the source of product direction.
@@ -1333,6 +1348,17 @@ Each entry is a plist: :name :description :schema :handler.")
                      (parameters . ,(plist-get tool :schema))))))
     codetutor--tools)))
 
+(defun codetutor--project-mtime-token (root)
+  "Return a token that changes when ROOT's project files change.
+
+Used to invalidate the cached project symbol table without re-parsing."
+  (let ((root-dir (file-name-as-directory (expand-file-name root))))
+    (sxhash-equal
+     (mapcar (lambda (rel)
+               (let ((attrs (file-attributes (expand-file-name rel root-dir))))
+                 (cons rel (and attrs (file-attribute-modification-time attrs)))))
+             (codetutor--project-files root-dir)))))
+
 (defun codetutor--dispatch-tool (root ctx name args)
   "Run tool NAME with ARGS for ROOT and CTX; return a capped result string."
   (let ((tool (cl-find name codetutor--tools
@@ -1451,13 +1477,18 @@ Each entry is a plist: :name :description :schema :handler.")
 (defun codetutor--project-symbol-table (root &optional name-filter)
   "Return the project symbol table for ROOT, optionally filtered by NAME-FILTER.
 
-The table is built once per session and cached on the session plist; it is
-rebuilt when `codetutor-refresh-architecture-memory' clears the cache."
+The parsed table is cached on the session plist as (TOKEN . TABLE) and rebuilt
+only when the project's files change (or when `codetutor-cache-tool-results' is
+nil, or `codetutor-refresh-architecture-memory' clears the cache)."
   (let* ((session (codetutor--session root))
-         (table (or (plist-get session :symbol-table)
-                    (let ((built (codetutor--build-symbol-table root)))
-                      (setf (plist-get session :symbol-table) built)
-                      built))))
+         (token (and codetutor-cache-tool-results
+                     (codetutor--project-mtime-token root)))
+         (cached (plist-get session :symbol-table))
+         (table (if (and cached token (equal (car cached) token))
+                    (cdr cached)
+                  (let ((built (codetutor--build-symbol-table root)))
+                    (setf (plist-get session :symbol-table) (cons token built))
+                    built))))
     (codetutor--render-symbol-table table name-filter)))
 
 ;;; Fireworks agentic loop --------------------------------------------------
@@ -1474,8 +1505,8 @@ task, the current-file outline, the diff (on save), and the file index."
          (file-index (codetutor--project-file-index project-root))
          (spec-context (codetutor--spec-context
                         project-root (when (eq kind 'spec) diff)))
-         (spec-instruction (when (memq kind '(spec spec-implement))
-                             (codetutor--spec-instruction kind)))
+         (posture-instruction (codetutor--kind-instruction kind))
+         (pinned-context (codetutor--pinned-context project-root))
          (diff-text (when diff (codetutor--truncate diff codetutor-max-diff-bytes))))
     (string-join
      (delq
@@ -1484,9 +1515,11 @@ task, the current-file outline, the diff (on save), and the file index."
        (format "REQUEST TYPE: %s" kind)
        (format "PROJECT ROOT:\n%s" project-root)
        (when user-request (format "USER REQUEST:\n%s" user-request))
+       (when pinned-context
+         (format "PINNED CONTEXT (always included while open):\n\n%s" pinned-context))
        (when conversation (format "RECENT CONVERSATION:\n%s" conversation))
        (when spec-context (format "SPEC STATUS:\n%s" spec-context))
-       spec-instruction
+       posture-instruction
        (format "CURRENT FILE: %s" (or current-file "none"))
        (format "CURRENT FILE OUTLINE:\n%s" outline)
        (when diff-text (format "DIFF SINCE LAST SAVE:\n%s" diff-text))
@@ -2201,6 +2234,20 @@ edited is identified and named."
 - Tie the change to the spec: which requirement it advances, whether it meets the acceptance criteria, what is still missing.
 - Teach the next build slice and the test that would prove it.")))
 
+(defconst codetutor--scratch-instruction
+  "SCRATCH MODE (teach-only):
+- The user is thinking out loud while building, in the SCRATCH notes pinned above. Respond to their latest thoughts and questions.
+- Teach the next concrete move and the concept behind it; never write the code for them.
+- Be tight and practical: they are mid-build, not reading an essay."
+  "Teach-only posture for scratch (thoughts) requests.")
+
+(defun codetutor--kind-instruction (kind)
+  "Return the teach-only posture instruction for request KIND, or nil."
+  (pcase kind
+    ((or 'spec 'spec-implement) (codetutor--spec-instruction kind))
+    ('scratch codetutor--scratch-instruction)
+    (_ nil)))
+
 (defun codetutor--save-request (kind touched)
   "Return the user-request string for a save of KIND (TOUCHED section optional)."
   (pcase kind
@@ -2235,8 +2282,8 @@ spec is active, otherwise `save'."
       (max 8 (round (* (frame-height) codetutor-spec-window-height)))
     codetutor-spec-window-height))
 
-(defun codetutor--display-spec-layout (root spec-file)
-  "Show SPEC-FILE in the main window and the tutor panel below it for ROOT."
+(defun codetutor--display-workbench (root top-buffer)
+  "Show TOP-BUFFER in the main window and the tutor panel below it for ROOT."
   (let ((panel (codetutor--panel-buffer root)))
     ;; Close any window already showing the panel (e.g. the right side window
     ;; from a prior request) so the workbench has exactly one panel window.
@@ -2244,14 +2291,17 @@ spec is active, otherwise `save'."
       (when (window-live-p win)
         (ignore-errors (delete-window win))))
     (delete-other-windows)
-    (let ((spec-buffer (find-file-noselect spec-file)))
-      (switch-to-buffer spec-buffer)
-      (display-buffer-in-side-window
-       panel
-       `((side . bottom)
-         (slot . 1)
-         (window-height . ,(codetutor--spec-window-height))))
-      spec-buffer)))
+    (switch-to-buffer top-buffer)
+    (display-buffer-in-side-window
+     panel
+     `((side . bottom)
+       (slot . 1)
+       (window-height . ,(codetutor--spec-window-height))))
+    top-buffer))
+
+(defun codetutor--display-spec-layout (root spec-file)
+  "Show SPEC-FILE in the main window and the tutor panel below it for ROOT."
+  (codetutor--display-workbench root (find-file-noselect spec-file)))
 
 (defun codetutor--spec-kickoff (root)
   "Start a proactive spec-writing interview for ROOT."
@@ -2312,6 +2362,124 @@ panel, and starts a proactive tutoring interview."
   (interactive)
   (codetutor--set-active-spec (codetutor--project-root) nil)
   (message "CodeTutor: active spec cleared."))
+
+;;; Scratch (thoughts) buffer + pinned context ------------------------------
+
+(defvar-local codetutor--scratch-root nil
+  "Project root associated with a CodeTutor scratch buffer.")
+
+(defun codetutor--scratch-buffer-name (root)
+  "Return the scratch buffer name for ROOT."
+  (format "*CodeTutor Scratch: %s*"
+          (directory-file-name
+           (file-name-nondirectory
+            (directory-file-name (file-name-as-directory (expand-file-name root)))))))
+
+(defun codetutor--scratch-buffer-if-live (root)
+  "Return ROOT's scratch buffer if it exists, else nil."
+  (get-buffer (codetutor--scratch-buffer-name root)))
+
+(defun codetutor--open-spec-buffers (root)
+  "Return live buffers visiting spec files under ROOT."
+  (cl-remove-if-not
+   (lambda (buf)
+     (let ((file (buffer-local-value 'buffer-file-name buf)))
+       (and file (codetutor--spec-file-p file root))))
+   (buffer-list)))
+
+(defun codetutor--pinned-context (root)
+  "Return labeled pinned-context sections for ROOT, or nil.
+
+Pins open spec documents (their live, possibly-unsaved text) and the scratch
+buffer so they ride in every prompt while open."
+  (let (sections)
+    (dolist (buf (codetutor--open-spec-buffers root))
+      (with-current-buffer buf
+        (push (format "PINNED SPEC DOCUMENT — %s%s:\n%s"
+                      (file-relative-name buffer-file-name root)
+                      (if (buffer-modified-p) " (unsaved edits)" "")
+                      (codetutor--truncate
+                       (buffer-substring-no-properties (point-min) (point-max))
+                       codetutor-max-current-file-bytes))
+              sections)))
+    (let ((scratch (codetutor--scratch-buffer-if-live root)))
+      (when scratch
+        (with-current-buffer scratch
+          (let ((text (string-trim
+                       (buffer-substring-no-properties (point-min) (point-max)))))
+            (unless (string-empty-p text)
+              (push (format "SCRATCH — the user's live thoughts, notes, and questions while building (treat as the current focus; teach against these):\n%s"
+                            (codetutor--truncate text codetutor-scratch-max-bytes))
+                    sections))))))
+    (when sections
+      (string-join (nreverse sections) "\n\n"))))
+
+(defvar codetutor-scratch-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "C-x C-s") #'codetutor-scratch-submit)
+    (define-key map (kbd "C-c C-c") #'codetutor-scratch-submit)
+    (define-key map (kbd "C-c C-k") #'codetutor-scratch-clear)
+    map)
+  "Keymap for `codetutor-scratch-mode'.")
+
+(define-minor-mode codetutor-scratch-mode
+  "Minor mode for the CodeTutor scratch (thoughts) buffer.
+
+Saving the buffer submits your thoughts to the tutor instead of writing a file."
+  :lighter " Scratch"
+  :keymap codetutor-scratch-mode-map
+  (setq-local buffer-offer-save nil))
+
+(defun codetutor--scratch-buffer (root)
+  "Return (creating if needed) the scratch buffer for ROOT."
+  (let ((buffer (get-buffer-create (codetutor--scratch-buffer-name root))))
+    (with-current-buffer buffer
+      (unless (bound-and-true-p codetutor-scratch-mode)
+        (codetutor-scratch-mode 1)
+        (setq codetutor--scratch-root root)))
+    buffer))
+
+;;;###autoload
+(defun codetutor-scratch ()
+  "Open the CodeTutor scratch buffer for thinking out loud while building.
+
+Type thoughts and questions, then save (\\[codetutor-scratch-submit]) to ask
+the tutor.  The scratch buffer is ephemeral but persists for the session; clear
+it with \\[codetutor-scratch-clear].  Its contents are pinned into every tutor
+request while it has text."
+  (interactive)
+  (let* ((root (codetutor--project-root))
+         (buffer (codetutor--scratch-buffer root)))
+    (codetutor--display-workbench root buffer)
+    (message "CodeTutor scratch: jot thoughts, then C-x C-s (or C-c C-c) to ask; C-c C-k clears.")
+    buffer))
+
+;;;###autoload
+(defun codetutor-scratch-submit ()
+  "Submit the scratch buffer's thoughts to the tutor (teach-only)."
+  (interactive)
+  (let* ((root (or codetutor--scratch-root (codetutor--project-root)))
+         (text (string-trim (buffer-substring-no-properties (point-min) (point-max))))
+         (request "Respond to my latest thoughts and questions in the scratch notes. Teach me the next move as I build, and keep it tight. Do not write the code for me."))
+    (if (string-empty-p text)
+        (message "CodeTutor scratch is empty.")
+      (codetutor--display-panel root)
+      (codetutor--request
+       :root root :kind 'scratch :title "Scratch" :manual t
+       :user-request request
+       :prompt (codetutor--build-prompt 'scratch :root root :user-request request)))))
+
+;;;###autoload
+(defun codetutor-scratch-clear ()
+  "Clear the CodeTutor scratch buffer."
+  (interactive)
+  (let ((buffer (or (and codetutor--scratch-root
+                         (codetutor--scratch-buffer-if-live codetutor--scratch-root))
+                    (codetutor--scratch-buffer-if-live (codetutor--project-root)))))
+    (if (null buffer)
+        (message "No CodeTutor scratch buffer.")
+      (with-current-buffer buffer (erase-buffer))
+      (message "CodeTutor scratch cleared."))))
 
 (provide 'codetutor)
 

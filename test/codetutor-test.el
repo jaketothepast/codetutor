@@ -548,4 +548,63 @@
       (remhash (file-name-as-directory (expand-file-name root)) codetutor--sessions)
       (delete-directory root t))))
 
+;;; Scratch buffer + pinned context ------------------------------------------
+
+(ert-deftest codetutor-pinned-context-nil-when-nothing-open ()
+  (let ((root (file-name-as-directory (make-temp-file "codetutor-pin-none-" t))))
+    (unwind-protect
+        (should (null (codetutor--pinned-context root)))
+      (delete-directory root t))))
+
+(ert-deftest codetutor-pinned-context-includes-scratch ()
+  (let* ((root (file-name-as-directory (make-temp-file "codetutor-pin-scratch-" t)))
+         (scratch (codetutor--scratch-buffer root)))
+    (unwind-protect
+        (progn
+          (with-current-buffer scratch
+            (insert "Should the parser stream or buffer?"))
+          (let ((pinned (codetutor--pinned-context root)))
+            (should (string-match-p "SCRATCH —" pinned))
+            (should (string-match-p "stream or buffer" pinned)))
+          ;; clearing removes it from pinned context
+          (with-current-buffer scratch (erase-buffer))
+          (should (null (codetutor--pinned-context root))))
+      (when (buffer-live-p scratch) (kill-buffer scratch))
+      (delete-directory root t))))
+
+(ert-deftest codetutor-pinned-context-includes-open-spec-buffer ()
+  (let* ((root (file-name-as-directory (make-temp-file "codetutor-pin-spec-" t)))
+         (specfile (expand-file-name "spec/foo.md" root))
+         spec-buffer)
+    (unwind-protect
+        (progn
+          (make-directory (expand-file-name "spec" root))
+          (write-region "# Foo\n## Goals\nbe fast\n" nil specfile nil 'silent)
+          (setq spec-buffer (find-file-noselect specfile))
+          (let ((pinned (codetutor--pinned-context root)))
+            (should (string-match-p "PINNED SPEC DOCUMENT" pinned))
+            (should (string-match-p "be fast" pinned))))
+      (when (buffer-live-p spec-buffer) (kill-buffer spec-buffer))
+      (delete-directory root t))))
+
+(ert-deftest codetutor-scratch-prompt-has-pinned-and-posture ()
+  (let* ((root (file-name-as-directory (make-temp-file "codetutor-scratch-prompt-" t)))
+         (scratch (codetutor--scratch-buffer root)))
+    (unwind-protect
+        (with-current-buffer scratch
+          (insert "What is the cleanest boundary here?")
+          (let ((prompt (codetutor--build-prompt 'scratch :root root :user-request "respond")))
+            (should (string-match-p "PINNED CONTEXT" prompt))
+            (should (string-match-p "SCRATCH MODE (teach-only)" prompt))
+            (should (string-match-p "never write the code for them" prompt))
+            (should (string-match-p "cleanest boundary" prompt))))
+      (when (buffer-live-p scratch) (kill-buffer scratch))
+      (delete-directory root t))))
+
+(ert-deftest codetutor-kind-instruction-maps-postures ()
+  (should (string-match-p "SPEC MODE" (codetutor--kind-instruction 'spec)))
+  (should (string-match-p "BUILD MODE" (codetutor--kind-instruction 'spec-implement)))
+  (should (string-match-p "SCRATCH MODE" (codetutor--kind-instruction 'scratch)))
+  (should (null (codetutor--kind-instruction 'ask))))
+
 ;;; codetutor-test.el ends here

@@ -98,6 +98,7 @@ Restart Emacs after syncing.
 | `codetutor-new-spec` | `C-c t s` | Starts a new feature spec and opens the spec workbench. |
 | `codetutor-open-spec` | `C-c t S` | Opens an existing spec as the active spec. |
 | `codetutor-finish-spec` | none | Clears the active spec. |
+| `codetutor-scratch` | `C-c t t` | Opens the scratch buffer to think out loud while building. |
 
 ## How It Works
 
@@ -370,6 +371,36 @@ to decompose work into slices — it critiques your slices, it doesn't write the
       codetutor-spec-kickoff t           ;; proactive interview on new spec
       codetutor-spec-directory "spec")   ;; where specs live (already in context)
 ```
+
+## Scratch buffer (think out loud)
+
+When you don't want the ceremony of a spec and just want to *build*, `M-x
+codetutor-scratch` (`C-c t t`) opens the **CodeTutor scratch buffer** — a freeform
+place to jot thoughts, notes, and questions while you implement, with the tutor
+panel below. Type whatever you're thinking, then:
+
+| Key | Action |
+| --- | --- |
+| `C-x C-s` / `C-c C-c` | Submit your thoughts to the tutor (teach-only) |
+| `C-c C-k` | Clear the scratch buffer |
+
+The scratch buffer is **ephemeral** — it never touches disk — but it persists for
+the session and remembers what you've written until you clear it (like Emacs'
+`*scratch*`).
+
+### Pinned context
+
+Both the scratch buffer and any open **spec** documents are *pinned*: while they
+have content, they are inserted into **every** tutor request as clearly labeled
+sections (`SCRATCH — …`, `PINNED SPEC DOCUMENT — …`), so the tutor always has your
+current thinking and working spec in view — not buried as generic context. Open
+spec buffers are pinned with their **live, unsaved** text, so the tutor sees what
+you're typing, not just what's on disk.
+
+Pinning is teach-only like everything else: the tutor responds to your notes and
+teaches the next move; it never writes the code. The pinned scratch is capped by
+`codetutor-scratch-max-bytes` so a long thinking session can't bloat every
+request.
 
 ## Output Model
 
