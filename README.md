@@ -23,15 +23,16 @@ It should not:
 
 ## Status
 
-This is an early local package. It is designed for stock Emacs and Doom Emacs, with local `codex` and `pi` backends.
+This is an early package. It is designed for stock Emacs and Doom Emacs, with local `codex` and `pi` backends and an optional remote Fireworks AI backend.
 
 ## Requirements
 
 - Emacs 28.1 or newer
 - Optional but recommended: Emacs 29+ with built-in tree-sitter support
-- One local backend:
-  - `codex`
-  - `pi`
+- One backend:
+  - `codex` (local, read-only sandbox)
+  - `pi` (local, read-only tools)
+  - Fireworks AI (remote HTTP API via `curl`, plus an API key; optional `rg` for the search tool)
 
 CodeTutor degrades gracefully when tree-sitter is not available by using `imenu` where possible.
 
@@ -94,6 +95,9 @@ Restart Emacs after syncing.
 | `codetutor-ask` | `C-c t a` | Prompts from the minibuffer with current file/project context. |
 | `codetutor-follow-up` | `C-c t f` | Asks a follow-up about the previous answer using recent turns. |
 | `codetutor-refresh-architecture-memory` | `C-c t m` | Asks the tutor to refresh durable architecture notes. |
+| `codetutor-new-spec` | `C-c t s` | Starts a new feature spec and opens the spec workbench. |
+| `codetutor-open-spec` | `C-c t S` | Opens an existing spec as the active spec. |
+| `codetutor-finish-spec` | none | Clears the active spec. |
 
 ## How It Works
 
@@ -239,6 +243,134 @@ pi --print --tools read,grep,find,ls
 
 It can inspect files, but should not write or edit them.
 
+### Fireworks AI
+
+The Fireworks backend talks to the [Fireworks AI](https://fireworks.ai/) OpenAI-compatible HTTP API with `curl`. Use it when you do not have a local `codex` or `pi` CLI.
+
+It is **remote**: CodeTutor sends the gathered context (project files, current buffer, diffs, and architecture memory) to Fireworks. For that reason, `codetutor-backend 'auto` never selects it. You must opt in:
+
+```elisp
+(setq codetutor-backend 'fireworks)
+```
+
+Provide an API key in one of these ways (checked in order):
+
+```elisp
+;; 1. A custom variable (least preferred; avoid committing it):
+(setq codetutor-fireworks-api-key "fw_...")
+```
+
+```sh
+# 2. An environment variable:
+export FIREWORKS_API_KEY=fw_...
+```
+
+```text
+# 3. An auth-source entry, e.g. in ~/.authinfo.gpg:
+machine api.fireworks.ai password fw_...
+```
+
+The key is written to a `curl --config` file rather than passed as a command-line argument, so it does not appear in the process list.
+
+The request is built roughly like this:
+
+```sh
+curl --silent --show-error --fail-with-body \
+  --config "$CONFIG_WITH_AUTH_HEADER" \
+  --header "Content-Type: application/json" \
+  --data @"$BODY_JSON" \
+  https://api.fireworks.ai/inference/v1/chat/completions
+```
+
+Configure the model with `codetutor-fireworks-model` (or the generic `codetutor-model`); the default is `accounts/fireworks/models/glm-5p2`. Fireworks model identifiers are account-scoped paths such as `accounts/fireworks/models/<model>`. The serverless catalog rotates, so update the model if it starts returning a 404.
+
+#### Agentic tools
+
+By default (`codetutor-fireworks-use-tools` is `t`), the Fireworks backend does **not** receive one giant pre-packed prompt. Instead it gets a lean seed (the task, the current-file outline, the save diff, and the file index) plus a set of **read-only tools**, and it *pulls* the context it needs in an agentic loop — the way a senior engineer explores a codebase:
+
+| Tool | What it returns |
+| --- | --- |
+| `read_file` | A project file, optionally a line range. |
+| `list_directory` | Directory entries (ignored dirs omitted). |
+| `read_project_context` | `PROJECT.md`, `spec/`, and architecture memory. |
+| `read_current_file` | The file/buffer that triggered the request. |
+| `project_symbol_table` | A project-wide tree-sitter index of top-level symbols with file/line. |
+| `search_project` | Regex search results (`rg`, or `grep` fallback). |
+
+The loop runs as a sequence of Fireworks calls: the model requests tools, CodeTutor executes them locally and feeds back the results, and it repeats until the model answers or hits `codetutor-fireworks-max-tool-iterations` (default 8). Every tool is **read-only and sandboxed to the project root** — paths that escape the root (via `..` or absolute paths) are refused. The model can read your project but cannot modify it; the only automatic write remains `.codetutor/ARCHITECTURE.md`.
+
+The project symbol table is built with tree-sitter (no new dependencies) and cached per session; it is rebuilt when you run `codetutor-refresh-architecture-memory`. Files whose tree-sitter grammar is not installed are skipped, and the count is reported.
+
+Set `codetutor-fireworks-use-tools` to `nil` to fall back to the single-shot pre-packed prompt (the same shape `codex`/`pi` receive).
+
+#### Cost reporting
+
+Because each tool round is a separately billed Fireworks call, CodeTutor sums token usage across the whole loop and prints a line to the **minibuffer** when a request finishes (the panel stays answer-only):
+
+```text
+CodeTutor: 15,212 tokens (8,901 in / 6,311 out) · 3 tool calls · ~$0.0142 · session 41,330 tokens (~$0.039)
+```
+
+The `~$` figures appear only when you set both price customs to your current rates (Fireworks per-model pricing rotates):
+
+```elisp
+(setq codetutor-fireworks-cost-input-per-million 0.9
+      codetutor-fireworks-cost-output-per-million 0.9)
+```
+
+With the prices unset, the line shows token counts only. Disable the report entirely with `(setq codetutor-show-cost nil)`.
+
+## Spec development mode
+
+Spec mode turns CodeTutor into a thinking partner for *starting* a feature, not
+just reviewing code. `M-x codetutor-new-spec` asks for a name, creates
+`spec/<slug>.md` from a teaching template, and opens a two-pane workbench — the
+spec document on top, the tutor panel below — then kicks off a proactive
+interview ("what problem does this solve, and for whom?").
+
+It is **teach-only**, end to end. The tutor never writes your spec or your code;
+it interviews you, critiques what you wrote, names the gaps (missing requirements,
+edge cases, non-goals), and teaches you how to actually *build* the feature.
+
+### The template teaches first
+
+A new spec opens pre-filled with sections, each carrying a guiding comment you
+replace:
+
+```markdown
+## Requirements (acceptance criteria)
+<!-- Concrete, testable statements. "Given/when/then" works well. -->
+```
+
+The sections are Problem / Goals / Non-goals / Requirements / Design / Build plan
+/ Open questions / Risks. Customize the scaffold with `codetutor-spec-template`.
+
+### The loop, from idea to built software
+
+Once a spec is **active**, it becomes the lens for everything (the only state is a
+single in-session pointer; the doc itself is the source of truth, re-parsed each
+request):
+
+- **Save a spec file** → the tutor reviews *the section you just edited*, names
+  what's missing, and points you to the next empty section.
+- **Save a code file while a spec is active** → the tutor teaches the change
+  *against the spec*: which requirement it advances, the next build slice, and the
+  test that would prove it.
+- **`M-x codetutor-what-next`** with a spec active → teaches the next build slice.
+- **`M-x codetutor-finish-spec`** → code saves return to the normal review posture.
+
+So the spec is the throughline: idea → requirements → design → build plan →
+implementation, with the tutor teaching the judgment at each step (including how
+to decompose work into slices — it critiques your slices, it doesn't write them).
+
+### Customization
+
+```elisp
+(setq codetutor-spec-window-height 0.4   ;; tutor panel height (lines or fraction)
+      codetutor-spec-kickoff t           ;; proactive interview on new spec
+      codetutor-spec-directory "spec")   ;; where specs live (already in context)
+```
+
 ## Output Model
 
 The side panel is intentionally not a chat transcript.
@@ -290,12 +422,35 @@ Good CodeTutor output should feel like a senior engineer pairing with you, not l
 Common settings:
 
 ```elisp
-(setq codetutor-backend 'auto)        ;; 'auto, 'codex, or 'pi
+(setq codetutor-backend 'auto)        ;; 'auto, 'codex, 'pi, or 'fireworks
 (setq codetutor-model nil)            ;; nil uses backend default
 (setq codetutor-window-width 84)
 (setq codetutor-review-on-save t)
 (setq codetutor-enable-web-search t)
 (setq codetutor-include-open-buffers-on-save t)
+```
+
+Fireworks AI backend:
+
+```elisp
+(setq codetutor-fireworks-api-key nil)  ;; nil resolves env/auth-source
+(setq codetutor-fireworks-model "accounts/fireworks/models/glm-5p2")
+(setq codetutor-fireworks-api-base "https://api.fireworks.ai/inference/v1")
+(setq codetutor-fireworks-max-tokens 2048)
+(setq codetutor-fireworks-temperature 0.3)
+```
+
+Fireworks agentic tools and cost:
+
+```elisp
+(setq codetutor-fireworks-use-tools t)          ;; nil = single-shot prompt
+(setq codetutor-fireworks-max-tool-iterations 8)
+(setq codetutor-tool-max-output-bytes 20000)    ;; per-tool result cap
+(setq codetutor-symbol-table-max-files 400)
+(setq codetutor-search-command "rg")            ;; falls back to grep
+(setq codetutor-show-cost t)
+(setq codetutor-fireworks-cost-input-per-million nil)   ;; set for $ estimates
+(setq codetutor-fireworks-cost-output-per-million nil)
 ```
 
 Context limits:
@@ -325,7 +480,7 @@ CodeTutor has two layers of protection:
 1. Prompt-level boundaries tell the tutor not to edit files or produce patches.
 2. Backend command boundaries use read-only modes/tools where available.
 
-For Codex, the package uses a read-only sandbox. For pi, it only enables read/search/list tools.
+For Codex, the package uses a read-only sandbox. For pi, it only enables read/search/list tools. For Fireworks AI, the agentic tools are all read-only and **sandboxed to the project root** — `read_file`/`list_directory`/`search_project` refuse paths that escape the root, there are no write or shell tools, and `search_project` passes its pattern as an argument (never through a shell). Because Fireworks is remote, the context the model fetches leaves your machine, so the backend is never chosen automatically and must be selected explicitly.
 
 The only automatic write CodeTutor performs itself is `.codetutor/ARCHITECTURE.md`.
 
