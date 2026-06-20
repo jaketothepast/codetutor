@@ -28,367 +28,12 @@
 (require 'imenu)
 (require 'treesit nil t)
 
-(declare-function auth-source-search "auth-source")
-
-(defgroup codetutor nil
-  "A read-only senior engineer tutor for Emacs."
-  :group 'tools
-  :prefix "codetutor-")
-
-(defcustom codetutor-backend 'auto
-  "Backend used for tutor requests.
-
-`auto' prefers Codex when available, then pi.dev.  `codex' uses
-`codex exec' with a read-only sandbox.  `pi' uses `pi --print'
-with only read/grep/find/ls tools enabled.  `fireworks' sends the
-gathered context to the Fireworks AI HTTP API over `curl'.
-
-`auto' never selects `fireworks': the remote backend transmits project
-files, diffs, and architecture memory off the machine, so it must be
-chosen explicitly."
-  :type '(choice (const :tag "Auto" auto)
-                 (const :tag "Codex CLI" codex)
-                 (const :tag "pi.dev CLI" pi)
-                 (const :tag "Fireworks AI" fireworks)))
-
-(defcustom codetutor-codex-command "codex"
-  "Command used to run the Codex CLI."
-  :type 'string)
-
-(defcustom codetutor-pi-command "pi"
-  "Command used to run the pi.dev CLI."
-  :type 'string)
-
-(defcustom codetutor-fireworks-command "curl"
-  "Command used to send Fireworks AI requests.
-
-CodeTutor talks to Fireworks over its OpenAI-compatible HTTP API.  Only
-`curl' is supported."
-  :type 'string)
-
-(defcustom codetutor-fireworks-api-base "https://api.fireworks.ai/inference/v1"
-  "Base URL for the Fireworks AI OpenAI-compatible API.
-
-The chat-completions endpoint is derived by appending
-`/chat/completions' to this value."
-  :type 'string)
-
-(defcustom codetutor-fireworks-model "accounts/fireworks/models/glm-5p2"
-  "Default Fireworks AI model used when `codetutor-model' is nil.
-
-Fireworks model identifiers are account-scoped paths such as
-`accounts/fireworks/models/<model>'.  The serverless catalog rotates, so
-update this if the model starts returning a 404."
-  :type 'string)
-
-(defcustom codetutor-fireworks-api-key nil
-  "Fireworks AI API key, or nil to resolve it elsewhere.
-
-When nil, CodeTutor reads the FIREWORKS_API_KEY environment variable and
-then falls back to `auth-source' (host `api.fireworks.ai').  Prefer the
-environment variable or `auth-source' over storing the key here."
-  :type '(choice (const :tag "Resolve from environment or auth-source" nil)
-                 string))
-
-(defcustom codetutor-fireworks-max-tokens 2048
-  "Maximum number of tokens Fireworks AI may generate per response."
-  :type 'integer)
-
-(defcustom codetutor-fireworks-temperature 0.3
-  "Sampling temperature for Fireworks AI requests."
-  :type 'number)
-
-(defcustom codetutor-fireworks-use-tools t
-  "Whether the Fireworks AI backend may pull context with read-only tools.
-
-When non-nil, CodeTutor runs an agentic loop: it sends a lean prompt plus a
-set of read-only tools and lets the model fetch project context on demand
-\(files, directories, a project symbol table, and search).  When nil, the
-Fireworks backend uses the single-shot path that pre-packs all context into
-one prompt, like the `codex' and `pi' backends."
-  :type 'boolean)
-
-(defcustom codetutor-fireworks-max-tool-iterations 8
-  "Maximum number of tool-call rounds in a Fireworks agentic request.
-
-Each round is a separately billed Fireworks call, so this caps token spend
-and prevents runaway loops.  On reaching the cap, CodeTutor asks for a final
-answer without further tools."
-  :type 'integer)
-
-(defcustom codetutor-tool-max-output-bytes 20000
-  "Maximum number of bytes returned to the model from a single tool call."
-  :type 'integer)
-
-(defcustom codetutor-cache-tool-results t
-  "Whether the project symbol table is cached until project files change.
-
-When non-nil, `project_symbol_table' reuses its cached tree-sitter parse while
-the project's file modification times are unchanged, rebuilding only when a
-file changes.  Set to nil to always rebuild."
-  :type 'boolean)
-
-(defcustom codetutor-symbol-table-max-files 400
-  "Maximum number of project files scanned for the project symbol table."
-  :type 'integer)
-
-(defcustom codetutor-search-command "rg"
-  "Command used by the `search_project' tool.
-
-When this command is not found, CodeTutor falls back to `grep'."
-  :type 'string)
-
-(defcustom codetutor-show-cost t
-  "Whether to report Fireworks token usage and cost in the minibuffer."
-  :type 'boolean)
-
-(defcustom codetutor-fireworks-cost-input-per-million nil
-  "US dollars per one million Fireworks prompt (input) tokens, or nil.
-
-When this and `codetutor-fireworks-cost-output-per-million' are both set,
-CodeTutor includes an estimated dollar cost in the usage report.  Fireworks
-serverless pricing rotates per model, so set this to your current rate."
-  :type '(choice (const :tag "Unknown (tokens only)" nil)
-                 number))
-
-(defcustom codetutor-fireworks-cost-output-per-million nil
-  "US dollars per one million Fireworks completion (output) tokens, or nil.
-
-See `codetutor-fireworks-cost-input-per-million'."
-  :type '(choice (const :tag "Unknown (tokens only)" nil)
-                 number))
-
-(defcustom codetutor-model nil
-  "Optional model name passed to the selected backend.
-
-When nil, the backend default is used."
-  :type '(choice (const :tag "Backend default" nil)
-                 string))
-
-(defcustom codetutor-enable-web-search t
-  "Whether Codex requests should enable web search.
-
-This only affects the Codex backend.  pi.dev provider behavior depends on
-the pi.dev configuration."
-  :type 'boolean)
-
-(defcustom codetutor-window-width 84
-  "Width of the CodeTutor side window.
-
-When this is an integer, it is treated as a number of columns.  When this
-is a float, it is treated as a fraction of the current frame width."
-  :type '(choice integer float))
-
-(defcustom codetutor-open-on-enable t
-  "Whether `codetutor-mode' should open the side panel immediately."
-  :type 'boolean)
-
-(defcustom codetutor-start-session-on-open t
-  "Whether `codetutor-open' should run a startup assessment for the project."
-  :type 'boolean)
-
-(defcustom codetutor-review-on-save t
-  "Whether CodeTutor should review the diff after each file save."
-  :type 'boolean)
-
-(defcustom codetutor-skip-auto-request-while-busy t
-  "Whether automatic save reviews should be skipped when a request is running.
-
-Manual requests cancel the running request and start the new one."
-  :type 'boolean)
-
-(defcustom codetutor-project-files '("PROJECT.md" "Project.md" "project.md")
-  "Project-root files loaded into tutor context."
-  :type '(repeat string))
-
-(defcustom codetutor-spec-directory "spec"
-  "Project-root directory loaded into tutor context."
-  :type 'string)
-
-(defcustom codetutor-spec-file-regexp
-  "\\.\\(md\\|markdown\\|org\\|txt\\|rst\\|adoc\\|yaml\\|yml\\|json\\)\\'"
-  "Regular expression for files loaded from `codetutor-spec-directory'."
-  :type 'regexp)
-
-(defcustom codetutor-spec-template
-  "# {name}
-
-## Problem / Why
-<!-- What problem does this solve, and for whom? What is painful today? -->
-
-## Goals
-<!-- What must be true for this to be a success? Keep these outcome-focused. -->
-
-## Non-goals
-<!-- What are you deliberately NOT doing? Scope cuts make a spec honest. -->
-
-## Requirements (acceptance criteria)
-<!-- Concrete, testable statements. \"Given/when/then\" works well. -->
-
-## Design
-<!-- The shape of the solution: boundaries, data flow, key modules, tradeoffs. -->
-
-## Build plan (slices)
-<!-- Small, ordered, independently testable steps. Sequence to de-risk early. -->
-
-## Open questions
-<!-- What you are unsure about. The tutor will help you close these. -->
-
-## Risks & edge cases
-<!-- What could go wrong, and the inputs/states that are easy to forget. -->
-"
-  "Template for a new spec document.
-
-The substring `{name}' is replaced with the spec's title.  Each section
-carries an HTML comment that teaches what belongs there; you replace the
-comment with your own content."
-  :type 'string)
-
-(defcustom codetutor-spec-window-height 0.4
-  "Height of the tutor panel in spec mode.
-
-An integer is a number of lines; a float is a fraction of the frame height."
-  :type '(choice integer float))
-
-(defcustom codetutor-spec-kickoff t
-  "Whether opening a new spec starts a proactive tutoring interview."
-  :type 'boolean)
-
-(defcustom codetutor-scratch-max-bytes 8000
-  "Maximum bytes of the CodeTutor scratch buffer pinned into each prompt."
-  :type 'integer)
-
-(defcustom codetutor-memory-file ".codetutor/ARCHITECTURE.md"
-  "Project-relative file where CodeTutor stores durable architecture notes."
-  :type 'string)
-
-(defcustom codetutor-apply-memory-updates t
-  "Whether CodeTutor should append durable architecture memory notes."
-  :type 'boolean)
-
-(defcustom codetutor-max-project-context-bytes 80000
-  "Maximum number of bytes of project/spec/memory context sent per request."
-  :type 'integer)
-
-(defcustom codetutor-max-current-file-bytes 50000
-  "Maximum number of bytes of the current buffer sent per request."
-  :type 'integer)
-
-(defcustom codetutor-include-open-buffers-on-save t
-  "Whether save reviews should include other open project buffers as context."
-  :type 'boolean)
-
-(defcustom codetutor-max-open-buffers 12
-  "Maximum number of other open file-backed buffers included on save."
-  :type 'integer)
-
-(defcustom codetutor-max-open-buffer-bytes 20000
-  "Maximum number of bytes included for each other open buffer."
-  :type 'integer)
-
-(defcustom codetutor-max-open-buffer-context-bytes 80000
-  "Maximum total bytes of other open buffer context included on save."
-  :type 'integer)
-
-(defcustom codetutor-max-diff-bytes 60000
-  "Maximum number of bytes of save diff sent per request."
-  :type 'integer)
-
-(defcustom codetutor-max-file-index-entries 250
-  "Maximum number of project file paths included in context."
-  :type 'integer)
-
-(defcustom codetutor-max-conversation-turns 8
-  "Maximum number of prior conversation turns included in tutor prompts."
-  :type 'integer)
-
-(defcustom codetutor-max-conversation-bytes 30000
-  "Maximum number of bytes of prior conversation included in tutor prompts."
-  :type 'integer)
-
-(defcustom codetutor-ignored-directories
-  '(".git" ".hg" ".svn" "node_modules" "vendor" "dist" "build" ".next"
-    ".turbo" ".venv" "venv" "__pycache__" ".mypy_cache" ".pytest_cache"
-    ".elixir_ls" "_build" "deps" "target" ".codetutor")
-  "Directory names excluded from fallback project file indexing."
-  :type '(repeat string))
-
-(defcustom codetutor-language-by-major-mode
-  '((python-mode . python)
-    (python-ts-mode . python)
-    (js-mode . javascript)
-    (js-ts-mode . javascript)
-    (js2-mode . javascript)
-    (typescript-mode . typescript)
-    (typescript-ts-mode . typescript)
-    (tsx-ts-mode . tsx)
-    (ruby-mode . ruby)
-    (ruby-ts-mode . ruby)
-    (go-mode . go)
-    (go-ts-mode . go)
-    (rust-mode . rust)
-    (rust-ts-mode . rust)
-    (c-mode . c)
-    (c-ts-mode . c)
-    (c++-mode . cpp)
-    (c++-ts-mode . cpp)
-    (java-mode . java)
-    (java-ts-mode . java)
-    (json-mode . json)
-    (json-ts-mode . json)
-    (yaml-mode . yaml)
-    (yaml-ts-mode . yaml)
-    (toml-mode . toml)
-    (toml-ts-mode . toml)
-    (css-mode . css)
-    (css-ts-mode . css)
-    (html-mode . html)
-    (html-ts-mode . html)
-    (sh-mode . bash)
-    (bash-ts-mode . bash))
-  "Mapping from major modes to tree-sitter language symbols."
-  :type '(alist :key-type symbol :value-type symbol))
-
-(defcustom codetutor-system-prompt
-  (string-join
-   '("You are CodeTutor, a senior/staff engineer pair-programming tutor inside Emacs."
-     ""
-     "Purpose:"
-     "- Help the user learn as they code."
-     "- Teach the underlying concepts, engineering judgment, architecture, testing, and maintainability tradeoffs behind the work."
-     "- Guide the user toward writing the code themselves."
-     ""
-     "Hard boundaries:"
-     "- Never edit files."
-     "- Never produce patches, full implementations, or replacement files."
-     "- You may provide short, clearly labeled illustrative code samples when they teach a concept, API shape, testing approach, or refactoring pattern."
-     "- Code samples should be examples, sketches, or analogous fragments, not complete ready-to-paste solutions for the user's exact task."
-     "- Prefer questions, conceptual framing, debugging heuristics, and next-step guidance."
-     "- If you inspect files or research best practices, summarize what matters and cite sources when available."
-     "- Your final answer must contain only the tutor response. Do not echo the prompt, request metadata, project context, file contents, diffs, or tool transcripts."
-     ""
-     "Response style:"
-     "- Be direct, concise, and senior-engineer practical."
-     "- Explain why the advice matters."
-     "- Include one concrete next move the user can take."
-     "- Teach one concept that transfers beyond this specific file."
-     "- When a code sample would make the concept clearer, include a compact snippet and explain how to adapt it."
-     "- Keep feedback proportional to the diff; do not overwhelm the user."
-     ""
-     "Architecture memory:"
-     "- Maintain an evolving understanding of this project's architecture."
-     "- At the end of every response, include a fenced block exactly named codetutor-memory."
-     "- Put only durable architecture observations in that block, one bullet per line."
-     "- If there is nothing durable to remember, leave the block empty."
-     "- Do not put code in the memory block."
-     "- Wrap the visible tutor answer in <codetutor-answer> and </codetutor-answer> tags. Put the codetutor-memory block after those tags.")
-   "\n")
-  "System-style instructions included in every tutor request."
-  :type 'string)
-
-(defvar codetutor--sessions (make-hash-table :test #'equal))
-(defvar codetutor--pre-save (make-hash-table :test #'eq))
-(defvar codetutor--writing-memory nil)
+;; CodeTutor is split across modules; this umbrella loads them in order.
+(require 'codetutor-vars)
+(require 'codetutor-backend)
+(require 'codetutor-tools)
+(require 'codetutor-agent)
+(require 'codetutor-inline-tips)
 
 (defvar codetutor-mode-map
   (let ((map (make-sparse-keymap)))
@@ -400,6 +45,7 @@ An integer is a number of lines; a float is a fraction of the frame height."
     (define-key map (kbd "C-c t s") #'codetutor-new-spec)
     (define-key map (kbd "C-c t S") #'codetutor-open-spec)
     (define-key map (kbd "C-c t t") #'codetutor-scratch)
+    (define-key map (kbd "C-c t i") #'codetutor-inline-tips)
     map)
   "Keymap used by `codetutor-mode'.")
 
@@ -415,6 +61,7 @@ An integer is a number of lines; a float is a fraction of the frame height."
 When enabled, CodeTutor can open a right-side panel, review diffs after
 saves, answer minibuffer prompts, and recommend what to do next."
   :global t
+  :group 'codetutor
   :lighter " Tutor"
   :keymap codetutor-mode-map
   (if codetutor-mode
@@ -532,6 +179,49 @@ does not display the prompt text."
             'memory-refresh
             :user-request "Inspect the project context and file index. Refresh your durable understanding of the architecture. Focus on domain boundaries, important modules, design direction, conventions, and architectural gaps worth guiding me on. Do not suggest code changes unless they are necessary as learning goals.")))
 
+(defconst codetutor--inline-tips-request
+  "Read the code file I am editing and place short teaching annotations on the most valuable specific lines. Call annotate_line once per tip (between 3 and 8 tips), each 1-3 sentences. Then give me a one-paragraph summary of the themes. Do not write the code for me."
+  "User-request string sent for an inline-tips run.")
+
+;;;###autoload
+(defun codetutor-inline-tips ()
+  "Annotate the current code buffer with inline teaching tips from CodeTutor.
+The tutor reads the buffer and places short annotations on specific lines
+via the `annotate_line' tool.  Requires the Fireworks agentic backend.
+
+Refuses to run on spec documents, the CodeTutor scratch buffer, the tutor
+panel, or any non-file-backed buffer."
+  (interactive)
+  (let ((buffer (current-buffer))
+        (file buffer-file-name)
+        (root (codetutor--project-root)))
+    ;; Reject panel / scratch first so the message is specific (both are
+    ;; non-file buffers and would otherwise hit the generic check).
+    (when (derived-mode-p 'codetutor-panel-mode)
+      (user-error "Run inline tips from a code buffer, not the CodeTutor panel"))
+    (when (bound-and-true-p codetutor-scratch-mode)
+      (user-error "Inline tips do not apply to the CodeTutor scratch buffer"))
+    (unless file
+      (user-error "CodeTutor inline tips need a file-backed buffer"))
+    (when (codetutor--spec-file-p file root)
+      (user-error "Inline tips are for code files, not spec documents"))
+    (unless (and (eq (codetutor--select-backend) 'fireworks)
+                 codetutor-fireworks-use-tools)
+      (user-error "Inline tips require the Fireworks agentic backend (set `codetutor-backend' to `fireworks' and keep `codetutor-fireworks-use-tools' non-nil)"))
+    (codetutor-clear-inline-tips buffer)
+    (codetutor--display-panel root)
+    (codetutor--request
+     :root root
+     :kind 'inline-tips
+     :title "Inline Tips"
+     :manual t
+     :file file
+     :user-request codetutor--inline-tips-request
+     :target-buffer buffer
+     :prompt (codetutor--build-prompt
+              'inline-tips :root root :file file
+              :user-request codetutor--inline-tips-request))))
+
 (defun codetutor--startup (root)
   "Start a CodeTutor session for ROOT."
   (codetutor--request
@@ -545,7 +235,8 @@ does not display the prompt text."
             :root root
             :user-request "Start a tutoring session for this project. Examine the current state of the world from PROJECT.md, spec/, architecture memory, current file context, and the file index. Tell me where to begin, what to learn first, and what engineering judgment I should apply before writing code.")))
 
-(cl-defun codetutor--request (&key root kind title prompt manual user-request file diff)
+(cl-defun codetutor--request (&key root kind title prompt manual user-request
+                                   file diff target-buffer)
   "Run a tutor request for ROOT with KIND, TITLE, and PROMPT.
 
 MANUAL requests cancel an active request.  Automatic requests may be skipped
@@ -553,7 +244,9 @@ when `codetutor-skip-auto-request-while-busy' is non-nil.
 
 When the Fireworks backend is selected and `codetutor-fireworks-use-tools' is
 non-nil, the request runs as an agentic tool-calling loop that builds its own
-lean prompt from KIND, FILE, DIFF, and USER-REQUEST instead of PROMPT."
+lean prompt from KIND, FILE, DIFF, and USER-REQUEST instead of PROMPT.
+TARGET-BUFFER, when given (inline-tips runs), is the code buffer the agent
+annotates; it is threaded into the agent context."
   (let* ((session (codetutor--session root))
          (existing (plist-get session :process))
          (panel (codetutor--panel-buffer root)))
@@ -569,7 +262,7 @@ lean prompt from KIND, FILE, DIFF, and USER-REQUEST instead of PROMPT."
                codetutor-fireworks-use-tools)
       (cl-return-from codetutor--request
         (codetutor--fireworks-agent-start
-         root kind title panel user-request file diff)))
+         root kind title panel user-request file diff target-buffer)))
     (let* ((backend (codetutor--backend-command root prompt))
            (backend-name (plist-get backend :name))
            (command (plist-get backend :command))
@@ -887,17 +580,23 @@ buffer file.  DIFF and USER-REQUEST are included when present."
         (goto-char (point-min))))))
 
 (defun codetutor--display-panel (root)
-  "Display and return the side-panel buffer for ROOT.
+  "Display and return the CodeTutor panel buffer for ROOT.
 
-When the panel is already visible (for example in the spec workbench's bottom
-window) it is reused rather than opened a second time in a side window."
+The panel docks per `codetutor-panel-side' (bottom by default, matching the
+spec/scratch workbench; or right).  When the panel is already visible (for
+example in the spec workbench's bottom window) it is reused rather than
+opened a second time."
   (let ((buffer (codetutor--panel-buffer root)))
     (unless (get-buffer-window buffer)
       (display-buffer-in-side-window
        buffer
-       `((side . right)
-         (slot . 1)
-         (window-width . ,(codetutor--window-width)))))
+       (if (eq codetutor-panel-side 'right)
+           `((side . right)
+             (slot . 1)
+             (window-width . ,(codetutor--window-width)))
+         `((side . bottom)
+           (slot . 1)
+           (window-height . ,(codetutor--panel-height))))))
     buffer))
 
 (defun codetutor--append (buffer text)
@@ -914,822 +613,17 @@ window) it is reused rather than opened a second time in a side window."
           (goto-char (point-max)))))))
 
 (defun codetutor--window-width ()
-  "Return the side-window width in columns."
+  "Return the right side-window width in columns."
   (if (floatp codetutor-window-width)
       (max 40 (round (* (frame-width) codetutor-window-width)))
     codetutor-window-width))
 
-(defun codetutor--backend-command (root prompt)
-  "Return a backend command plist for ROOT and PROMPT."
-  (pcase (codetutor--select-backend)
-    ('codex
-     (let* ((output-file (make-temp-file "codetutor-codex-answer-" nil ".md"))
-            (command (append
-                      (list codetutor-codex-command
-                            "--sandbox" "read-only"
-                            "--ask-for-approval" "never")
-                      (when codetutor-enable-web-search
-                        (list "--search"))
-                      (list "exec"
-                            "-C" root
-                            "--skip-git-repo-check"
-                            "--color" "never"
-                            "--ephemeral"
-                            "--output-last-message" output-file)
-                      (when codetutor-model
-                        (list "-m" codetutor-model))
-                      (list "-"))))
-       (list :name "Codex"
-             :command command
-             :stdin prompt
-             :output-file output-file
-             :temp-files (list output-file))))
-    ('pi
-     (let ((prompt-file (make-temp-file "codetutor-prompt-" nil ".md")))
-       (let ((coding-system-for-write 'utf-8))
-         (write-region prompt nil prompt-file nil 'silent))
-       (list :name "pi.dev"
-             :temp-files (list prompt-file)
-             :command
-             (append
-              (list codetutor-pi-command
-                    "--print"
-                    "--tools" "read,grep,find,ls"
-                    "--system-prompt" codetutor-system-prompt)
-              (when codetutor-model
-                (list "--model" codetutor-model))
-              (list (concat "@" prompt-file)
-                    "Respond to the CodeTutor request in the attached prompt file.")))))
-    ('fireworks
-     (let ((api-key (codetutor--fireworks-api-key)))
-       (if (null api-key)
-           (list :name "Fireworks AI"
-                 :command nil
-                 :message (concat "No Fireworks AI API key is available. "
-                                  "Set `codetutor-fireworks-api-key', the "
-                                  "FIREWORKS_API_KEY environment variable, or an "
-                                  "auth-source entry for host `api.fireworks.ai'."))
-         (let* ((model (or codetutor-model codetutor-fireworks-model))
-                (endpoint (concat (string-remove-suffix "/" codetutor-fireworks-api-base)
-                                  "/chat/completions"))
-                (config-file (make-temp-file "codetutor-fireworks-config-"))
-                (body-file (make-temp-file "codetutor-fireworks-body-" nil ".json"))
-                (body (codetutor--fireworks-request-body model prompt)))
-           (let ((coding-system-for-write 'utf-8-unix))
-             ;; `make-temp-file' creates 0600 files, so the secret config is
-             ;; not world-readable; overwriting preserves that mode.
-             (write-region (codetutor--fireworks-curl-config api-key)
-                           nil config-file nil 'silent)
-             (write-region body nil body-file nil 'silent))
-           (list :name "Fireworks AI"
-                 :temp-files (list config-file body-file)
-                 :parser #'codetutor--fireworks-parse-response
-                 :command
-                 (list codetutor-fireworks-command
-                       "--silent" "--show-error" "--fail-with-body"
-                       "--config" config-file
-                       "--header" "Content-Type: application/json"
-                       "--data" (concat "@" body-file)
-                       endpoint))))))
-    (_
-     (list :name nil :command nil))))
+(defun codetutor--panel-height ()
+  "Return the bottom panel height in lines."
+  (if (floatp codetutor-panel-height)
+      (max 8 (round (* (frame-height) codetutor-panel-height)))
+    codetutor-panel-height))
 
-(defun codetutor--select-backend ()
-  "Select an available backend."
-  (pcase codetutor-backend
-    ('codex (when (executable-find codetutor-codex-command) 'codex))
-    ('pi (when (executable-find codetutor-pi-command) 'pi))
-    ;; Require only the command here; `codetutor--backend-command' reports a
-    ;; specific message when the API key cannot be resolved.
-    ('fireworks (when (executable-find codetutor-fireworks-command) 'fireworks))
-    ;; `auto' never selects `fireworks': the remote backend transmits
-    ;; project context off the machine and must be chosen explicitly.
-    ('auto (cond
-            ((executable-find codetutor-codex-command) 'codex)
-            ((executable-find codetutor-pi-command) 'pi)))))
-
-(defun codetutor--nonempty-string (value)
-  "Return VALUE when it is a non-blank string, else nil."
-  (and (stringp value)
-       (not (string-empty-p (string-trim value)))
-       value))
-
-(defun codetutor--fireworks-api-key ()
-  "Return the Fireworks AI API key, or nil when none is configured.
-
-Resolution order: `codetutor-fireworks-api-key', the FIREWORKS_API_KEY
-environment variable, then an `auth-source' entry for host
-`api.fireworks.ai'."
-  (or (codetutor--nonempty-string codetutor-fireworks-api-key)
-      (codetutor--nonempty-string (getenv "FIREWORKS_API_KEY"))
-      (codetutor--fireworks-auth-source-key)))
-
-(defun codetutor--fireworks-auth-source-key ()
-  "Return a Fireworks AI API key from `auth-source', or nil."
-  (condition-case nil
-      (progn
-        (require 'auth-source)
-        (when-let* ((entry (car (auth-source-search
-                                 :host "api.fireworks.ai"
-                                 :require '(:secret)
-                                 :max 1)))
-                    (secret (plist-get entry :secret)))
-          (codetutor--nonempty-string
-           (if (functionp secret) (funcall secret) secret))))
-    (error nil)))
-
-(defun codetutor--fireworks-curl-config (api-key)
-  "Return curl --config file contents carrying API-KEY in an auth header.
-
-The key is written to a config file rather than passed as a command-line
-argument so it never appears in the process list."
-  (when (string-match-p "[\n\r]" api-key)
-    (error "CodeTutor: Fireworks API key must not contain newlines"))
-  (let ((escaped (replace-regexp-in-string "[\\\"]" "\\\\\\&" api-key)))
-    (format "header = \"Authorization: Bearer %s\"\n" escaped)))
-
-(defun codetutor--fireworks-messages (prompt)
-  "Return a Fireworks AI messages vector for PROMPT.
-
-`codetutor--build-prompt' embeds `codetutor-system-prompt' at the head of
-PROMPT.  When that preamble is present it is sent as a `system' message
-and stripped from the `user' message so the instructions are not
-duplicated."
-  (let ((preamble (concat codetutor-system-prompt "\n\n")))
-    (if (string-prefix-p preamble prompt)
-        (vector `((role . "system") (content . ,codetutor-system-prompt))
-                `((role . "user") (content . ,(substring prompt (length preamble)))))
-      (vector `((role . "user") (content . ,prompt))))))
-
-(defun codetutor--fireworks-request-body (model prompt)
-  "Return a JSON chat-completions request body for MODEL and PROMPT."
-  (json-serialize
-   `((model . ,model)
-     (messages . ,(codetutor--fireworks-messages prompt))
-     (max_tokens . ,codetutor-fireworks-max-tokens)
-     (temperature . ,codetutor-fireworks-temperature))))
-
-(defun codetutor--fireworks-parse-response (stdout)
-  "Extract assistant text or an error message from Fireworks STDOUT."
-  (let ((text (string-trim (or stdout ""))))
-    (if (string-empty-p text)
-        ""
-      (condition-case err
-          (let* ((data (json-parse-string text
-                                          :object-type 'alist
-                                          :array-type 'list))
-                 (error-info (alist-get 'error data))
-                 (choices (alist-get 'choices data)))
-            (cond
-             (error-info
-              (format "Fireworks API error: %s"
-                      (or (and (listp error-info) (alist-get 'message error-info))
-                          error-info)))
-             (choices
-              (let ((content (alist-get 'content (alist-get 'message (car choices)))))
-                (if (stringp content) content "")))
-             (t text)))
-        (error
-         (format "CodeTutor could not parse the Fireworks response: %s\n\n%s"
-                 (error-message-string err)
-                 text))))))
-
-(defun codetutor--fireworks-parse-data (stdout)
-  "Return the parsed Fireworks response alist from STDOUT, or nil.
-
-Returns nil on empty output, malformed JSON, or an API error payload (no
-`choices'); callers fall back to `codetutor--fireworks-parse-response' for a
-human-readable error string."
-  (let ((text (string-trim (or stdout ""))))
-    (unless (string-empty-p text)
-      (condition-case nil
-          (let ((data (json-parse-string text
-                                         :object-type 'alist
-                                         :array-type 'list)))
-            (when (alist-get 'choices data) data))
-        (error nil)))))
-
-(defun codetutor--fireworks-usage (data)
-  "Return (PROMPT . COMPLETION) token counts from response DATA."
-  (let ((usage (alist-get 'usage data)))
-    (cons (or (alist-get 'prompt_tokens usage) 0)
-          (or (alist-get 'completion_tokens usage) 0))))
-
-;;; Cost reporting ----------------------------------------------------------
-
-(defun codetutor--group-number (n)
-  "Return integer N as a string with thousands separators."
-  (let ((digits (number-to-string (abs n)))
-        (parts nil))
-    (while (> (length digits) 3)
-      (push (substring digits (- (length digits) 3)) parts)
-      (setq digits (substring digits 0 (- (length digits) 3))))
-    (push digits parts)
-    (concat (if (< n 0) "-" "") (string-join parts ","))))
-
-(defun codetutor--cost-dollars (prompt completion)
-  "Return estimated USD cost for PROMPT/COMPLETION tokens, or nil when unpriced."
-  (when (and (numberp codetutor-fireworks-cost-input-per-million)
-             (numberp codetutor-fireworks-cost-output-per-million))
-    (+ (* (/ prompt 1000000.0) codetutor-fireworks-cost-input-per-million)
-       (* (/ completion 1000000.0) codetutor-fireworks-cost-output-per-million))))
-
-(defun codetutor--format-cost (prompt completion tool-calls
-                                      session-prompt session-completion)
-  "Return a one-line usage/cost summary string.
-
-PROMPT and COMPLETION are this request's token counts, TOOL-CALLS the number of
-tool calls it made, and SESSION-PROMPT/SESSION-COMPLETION the cumulative session
-totals.  A dollar estimate is included only when both price customs are set."
-  (let ((dollars (codetutor--cost-dollars prompt completion))
-        (session-dollars (codetutor--cost-dollars session-prompt session-completion)))
-    (concat
-     (format "%s tokens (%s in / %s out)"
-             (codetutor--group-number (+ prompt completion))
-             (codetutor--group-number prompt)
-             (codetutor--group-number completion))
-     (when (> tool-calls 0)
-       (format " · %d tool call%s" tool-calls (if (= tool-calls 1) "" "s")))
-     (when dollars (format " · ~$%.4f" dollars))
-     (format " · session %s tokens"
-             (codetutor--group-number (+ session-prompt session-completion)))
-     (when session-dollars (format " (~$%.4f)" session-dollars)))))
-
-(defun codetutor--report-cost (session prompt completion tool-calls)
-  "Add PROMPT/COMPLETION tokens to SESSION totals and message the usage line."
-  (when codetutor-show-cost
-    (cl-incf (plist-get session :cost-prompt-tokens) prompt)
-    (cl-incf (plist-get session :cost-completion-tokens) completion)
-    (message "CodeTutor: %s"
-             (codetutor--format-cost
-              prompt completion tool-calls
-              (plist-get session :cost-prompt-tokens)
-              (plist-get session :cost-completion-tokens)))))
-
-;;; Read-only tools ---------------------------------------------------------
-
-(defun codetutor--resolve-project-path (root rel)
-  "Resolve REL against ROOT, returning an absolute path inside ROOT, or nil.
-
-Rejects paths that escape ROOT (via `..' or absolute paths), so tools can only
-read inside the project."
-  (when (stringp rel)
-    (let* ((root-dir (file-name-as-directory (expand-file-name root)))
-           (resolved (expand-file-name rel root-dir)))
-      (when (or (string= (file-name-as-directory resolved) root-dir)
-                (file-in-directory-p resolved root-dir))
-        resolved))))
-
-(defun codetutor--read-file-region (file rel start end)
-  "Return text of FILE (display name REL), optionally lines START..END."
-  (with-temp-buffer
-    (let ((coding-system-for-read 'utf-8))
-      (insert-file-contents file))
-    (let ((total (line-number-at-pos (point-max))))
-      (if (or (integerp start) (integerp end))
-          (let ((from (max 1 (or start 1)))
-                (to (min total (or end total)))
-                beg)
-            (if (> from to)
-                (format "Error: line range %s-%s is empty (%s has %d lines)."
-                        from to rel total)
-              (goto-char (point-min))
-              (forward-line (1- from))
-              (setq beg (point))
-              (goto-char (point-min))
-              (forward-line to)
-              (format "%s (lines %d-%d of %d):\n%s"
-                      rel from to total
-                      (buffer-substring-no-properties beg (point)))))
-        (format "%s (%d lines):\n%s"
-                rel total
-                (buffer-substring-no-properties (point-min) (point-max)))))))
-
-(defun codetutor--tool-read-file (root _ctx args)
-  "Tool: read a project file (optionally a line range)."
-  (let ((rel (alist-get 'path args))
-        (start (alist-get 'start_line args))
-        (end (alist-get 'end_line args)))
-    (if (not (stringp rel))
-        "Error: read_file requires a string \"path\"."
-      (let ((file (codetutor--resolve-project-path root rel)))
-        (cond
-         ((null file) (format "Error: %S is outside the project root." rel))
-         ((file-directory-p file)
-          (format "Error: %S is a directory; use list_directory." rel))
-         ((not (file-readable-p file)) (format "Error: cannot read %S." rel))
-         (t (codetutor--read-file-region file rel start end)))))))
-
-(defun codetutor--tool-list-directory (root _ctx args)
-  "Tool: list a project directory, skipping ignored directories."
-  (let* ((rel (or (alist-get 'path args) "."))
-         (dir (codetutor--resolve-project-path root rel)))
-    (cond
-     ((null dir) (format "Error: %S is outside the project root." rel))
-     ((not (file-directory-p dir)) (format "Error: %S is not a directory." rel))
-     (t (let ((entries
-               (cl-remove-if
-                (lambda (name)
-                  (or (member name '("." ".."))
-                      (member name codetutor-ignored-directories)))
-                (directory-files dir))))
-          (if (null entries)
-              (format "%s is empty." rel)
-            (string-join
-             (mapcar (lambda (name)
-                       (concat name
-                               (if (file-directory-p (expand-file-name name dir))
-                                   "/" "")))
-                     (sort entries #'string<))
-             "\n")))))))
-
-(defun codetutor--tool-read-project-context (root _ctx _args)
-  "Tool: return PROJECT.md/spec/architecture-memory context for ROOT."
-  (codetutor--project-context root))
-
-(defun codetutor--tool-read-current-file (_root ctx _args)
-  "Tool: return the file/buffer that triggered this request."
-  (or (plist-get ctx :current-file-context)
-      "No current file is associated with this request."))
-
-(defun codetutor--tool-project-symbol-table (root _ctx args)
-  "Tool: return the project-wide symbol table, optionally filtered."
-  (codetutor--project-symbol-table root (alist-get 'name_filter args)))
-
-(defun codetutor--search-project (root pattern rel)
-  "Search PATTERN under ROOT (optionally subpath REL) read-only, returning matches."
-  (let ((dir (if rel (codetutor--resolve-project-path root rel) root)))
-    (if (null dir)
-        (format "Error: %S is outside the project root." rel)
-      (let* ((rg (executable-find codetutor-search-command))
-             (program (or rg "grep"))
-             (default-directory (file-name-as-directory dir))
-             (args (if rg
-                       (list "--line-number" "--no-heading" "--color" "never"
-                             "--max-count" "50" "-e" pattern ".")
-                     (list "-rnI" "--" pattern "."))))
-        (if (not (or rg (executable-find "grep")))
-            "Error: no search command (rg/grep) is available."
-          (with-temp-buffer
-            (let ((exit (apply #'call-process program nil t nil args)))
-              (let ((out (string-trim
-                          (buffer-substring-no-properties (point-min) (point-max)))))
-                (cond
-                 ((string-empty-p out) "No matches.")
-                 ((memq exit '(0 1)) out)
-                 (t (format "Search exited with status %s.\n%s" exit out)))))))))))
-
-(defun codetutor--tool-search-project (root _ctx args)
-  "Tool: search the project for a regexp PATTERN."
-  (let ((pattern (alist-get 'pattern args))
-        (rel (alist-get 'path args)))
-    (if (not (stringp pattern))
-        "Error: search_project requires a string \"pattern\"."
-      (codetutor--search-project root pattern rel))))
-
-(defvar codetutor--tools
-  `((:name "read_file"
-     :description "Read a UTF-8 text file from the project, optionally a line range. Paths are relative to the project root."
-     :schema ((type . "object")
-              (properties
-               (path (type . "string")
-                     (description . "Project-relative path to the file."))
-               (start_line (type . "integer")
-                           (description . "1-based first line to include (optional)."))
-               (end_line (type . "integer")
-                         (description . "1-based last line to include (optional).")))
-              (required . ["path"]))
-     :handler codetutor--tool-read-file)
-    (:name "list_directory"
-     :description "List the entries of a project directory. Directories end with a slash. Ignored directories (.git, node_modules, ...) are omitted."
-     :schema ((type . "object")
-              (properties
-               (path (type . "string")
-                     (description . "Project-relative directory path. Defaults to the project root.")))
-              (required . []))
-     :handler codetutor--tool-list-directory)
-    (:name "read_project_context"
-     :description "Return product/project direction: PROJECT.md, the spec/ directory, and CodeTutor's architecture memory."
-     :schema ((type . "object") (properties . ,(make-hash-table :test 'equal)))
-     :handler codetutor--tool-read-project-context)
-    (:name "read_current_file"
-     :description "Return the file the user is currently editing (path, outline, and text) that triggered this request."
-     :schema ((type . "object") (properties . ,(make-hash-table :test 'equal)))
-     :handler codetutor--tool-read-current-file)
-    (:name "project_symbol_table"
-     :description "Return a project-wide index of top-level symbols (functions, classes, etc.) with their files and line numbers, built with tree-sitter."
-     :schema ((type . "object")
-              (properties
-               (name_filter (type . "string")
-                            (description . "Only return symbol lines containing this substring (optional).")))
-              (required . []))
-     :handler codetutor--tool-project-symbol-table)
-    (:name "search_project"
-     :description "Search the project for a regular expression and return matching file:line results (capped)."
-     :schema ((type . "object")
-              (properties
-               (pattern (type . "string")
-                        (description . "Regular expression to search for."))
-               (path (type . "string")
-                     (description . "Project-relative directory to limit the search (optional).")))
-              (required . ["pattern"]))
-     :handler codetutor--tool-search-project))
-  "Read-only tools exposed to the Fireworks agentic backend.
-Each entry is a plist: :name :description :schema :handler.")
-
-(defun codetutor--tool-specs ()
-  "Return the tools array (vector of function specs) for the Fireworks request."
-  (vconcat
-   (mapcar
-    (lambda (tool)
-      `((type . "function")
-        (function . ((name . ,(plist-get tool :name))
-                     (description . ,(plist-get tool :description))
-                     (parameters . ,(plist-get tool :schema))))))
-    codetutor--tools)))
-
-(defun codetutor--project-mtime-token (root)
-  "Return a token that changes when ROOT's project files change.
-
-Used to invalidate the cached project symbol table without re-parsing."
-  (let ((root-dir (file-name-as-directory (expand-file-name root))))
-    (sxhash-equal
-     (mapcar (lambda (rel)
-               (let ((attrs (file-attributes (expand-file-name rel root-dir))))
-                 (cons rel (and attrs (file-attribute-modification-time attrs)))))
-             (codetutor--project-files root-dir)))))
-
-(defun codetutor--dispatch-tool (root ctx name args)
-  "Run tool NAME with ARGS for ROOT and CTX; return a capped result string."
-  (let ((tool (cl-find name codetutor--tools
-                       :key (lambda (s) (plist-get s :name))
-                       :test #'equal)))
-    (if (null tool)
-        (format "Error: unknown tool %S." name)
-      (codetutor--truncate
-       (condition-case err
-           (or (funcall (plist-get tool :handler) root ctx args) "")
-         (error (format "Error running %s: %s" name (error-message-string err))))
-       codetutor-tool-max-output-bytes))))
-
-;;; Project-wide symbol table (tree-sitter) ---------------------------------
-
-(defun codetutor--file-major-mode (file)
-  "Return the major mode Emacs would choose for FILE, or nil."
-  (let ((mode (assoc-default file auto-mode-alist 'string-match)))
-    (when (consp mode) (setq mode (car mode)))
-    (and (symbolp mode) mode)))
-
-(defun codetutor--file-treesit-language (file)
-  "Return an available tree-sitter language symbol for FILE, or nil."
-  (let* ((mode (codetutor--file-major-mode file))
-         (language (and mode (alist-get mode codetutor-language-by-major-mode))))
-    (when (and language
-               (fboundp 'treesit-language-available-p)
-               (treesit-language-available-p language))
-      language)))
-
-(defun codetutor--treesit-symbol-line (node)
-  "Return a one-line symbol description for NODE, or nil when unnamed."
-  (let ((name (or (ignore-errors (treesit-defun-name node))
-                  (codetutor--treesit-child-name node))))
-    (when (and name (not (string-empty-p name)))
-      (format "  L%d  %s  %s"
-              (line-number-at-pos (treesit-node-start node))
-              (treesit-node-type node)
-              name))))
-
-(defun codetutor--file-symbol-lines (file language)
-  "Return top-level symbol lines for FILE parsed as LANGUAGE, or nil."
-  (condition-case nil
-      (with-temp-buffer
-        (let ((coding-system-for-read 'utf-8))
-          (insert-file-contents file))
-        (let* ((parser (treesit-parser-create language))
-               (root (treesit-parser-root-node parser))
-               (children (treesit-node-children root t)))
-          (delq nil (mapcar #'codetutor--treesit-symbol-line children))))
-    (error nil)))
-
-(defun codetutor--build-symbol-table (root)
-  "Build the project symbol table for ROOT as a plist."
-  (let* ((root-dir (file-name-as-directory (expand-file-name root)))
-         (files (codetutor--project-files root-dir))
-         (limited (cl-subseq files 0 (min (length files)
-                                          codetutor-symbol-table-max-files)))
-         (entries nil)
-         (symbol-files 0)
-         (skipped 0))
-    (dolist (rel limited)
-      (let ((language (codetutor--file-treesit-language rel)))
-        (if (null language)
-            (setq skipped (1+ skipped))
-          (let ((lines (codetutor--file-symbol-lines
-                        (expand-file-name rel root-dir) language)))
-            (when lines
-              (setq symbol-files (1+ symbol-files))
-              (push (cons rel lines) entries))))))
-    (list :entries (nreverse entries)
-          :scanned (length limited)
-          :total (length files)
-          :symbol-files symbol-files
-          :skipped skipped)))
-
-(defun codetutor--filter-symbol-entries (entries name-filter)
-  "Return ENTRIES keeping only symbol lines containing NAME-FILTER."
-  (delq nil
-        (mapcar
-         (lambda (entry)
-           (let ((matches (cl-remove-if-not
-                           (lambda (line)
-                             (string-match-p (regexp-quote name-filter) line))
-                           (cdr entry))))
-             (when matches (cons (car entry) matches))))
-         entries)))
-
-(defun codetutor--render-symbol-table (table name-filter)
-  "Render symbol TABLE as a string, optionally filtered by NAME-FILTER."
-  (let* ((filtering (and (stringp name-filter)
-                         (not (string-empty-p name-filter))))
-         (entries (plist-get table :entries))
-         (filtered (if filtering
-                       (codetutor--filter-symbol-entries entries name-filter)
-                     entries)))
-    (if (null filtered)
-        (if filtering
-            (format "No symbols matching %S in %d scanned files."
-                    name-filter (plist-get table :scanned))
-          "No symbols found (no installed tree-sitter grammars for this project's files).")
-      (concat
-       (format "Project symbols — %d files with symbols, %d of %d files scanned, %d skipped (no grammar)%s:\n\n"
-               (plist-get table :symbol-files)
-               (plist-get table :scanned)
-               (plist-get table :total)
-               (plist-get table :skipped)
-               (if filtering (format ", filtered by %S" name-filter) ""))
-       (string-join
-        (mapcar (lambda (entry)
-                  (format "%s\n%s" (car entry)
-                          (string-join (cdr entry) "\n")))
-                filtered)
-        "\n\n")))))
-
-(defun codetutor--project-symbol-table (root &optional name-filter)
-  "Return the project symbol table for ROOT, optionally filtered by NAME-FILTER.
-
-The parsed table is cached on the session plist as (TOKEN . TABLE) and rebuilt
-only when the project's files change (or when `codetutor-cache-tool-results' is
-nil, or `codetutor-refresh-architecture-memory' clears the cache)."
-  (let* ((session (codetutor--session root))
-         (token (and codetutor-cache-tool-results
-                     (codetutor--project-mtime-token root)))
-         (cached (plist-get session :symbol-table))
-         (table (if (and cached token (equal (car cached) token))
-                    (cdr cached)
-                  (let ((built (codetutor--build-symbol-table root)))
-                    (setf (plist-get session :symbol-table) (cons token built))
-                    built))))
-    (codetutor--render-symbol-table table name-filter)))
-
-;;; Fireworks agentic loop --------------------------------------------------
-
-(cl-defun codetutor--build-agent-seed-prompt (kind &key root file diff user-request)
-  "Build the lean seed prompt for an agentic Fireworks request of KIND.
-
-Deep context is left for the model to fetch with tools; this only seeds the
-task, the current-file outline, the diff (on save), and the file index."
-  (let* ((project-root (file-name-as-directory (or root (codetutor--project-root))))
-         (current-file (or file buffer-file-name))
-         (conversation (codetutor--conversation-context project-root))
-         (outline (codetutor--syntax-summary))
-         (file-index (codetutor--project-file-index project-root))
-         (spec-context (codetutor--spec-context
-                        project-root (when (eq kind 'spec) diff)))
-         (posture-instruction (codetutor--kind-instruction kind))
-         (pinned-context (codetutor--pinned-context project-root))
-         (diff-text (when diff (codetutor--truncate diff codetutor-max-diff-bytes))))
-    (string-join
-     (delq
-      nil
-      (list
-       (format "REQUEST TYPE: %s" kind)
-       (format "PROJECT ROOT:\n%s" project-root)
-       (when user-request (format "USER REQUEST:\n%s" user-request))
-       (when pinned-context
-         (format "PINNED CONTEXT (always included while open):\n\n%s" pinned-context))
-       (when conversation (format "RECENT CONVERSATION:\n%s" conversation))
-       (when spec-context (format "SPEC STATUS:\n%s" spec-context))
-       posture-instruction
-       (format "CURRENT FILE: %s" (or current-file "none"))
-       (format "CURRENT FILE OUTLINE:\n%s" outline)
-       (when diff-text (format "DIFF SINCE LAST SAVE:\n%s" diff-text))
-       (format "PROJECT FILE INDEX:\n%s" file-index)
-       "TOOLS:
-- You have read-only tools: read_file, list_directory, read_project_context, read_current_file, project_symbol_table, search_project.
-- Use them to gather any context you need before answering. Product/project direction lives in read_project_context.
-- Do not ask the user to paste code; fetch it yourself. All paths are relative to the project root. You cannot modify files."
-       "RESPONSE CONTRACT:
-- Teach the underlying concept and give one concrete next move.
-- Include a compact code example only when it teaches the idea better than prose.
-- Do not output patches, full-file replacements, or complete ready-to-paste implementations.
-- Wrap the visible answer in <codetutor-answer> and </codetutor-answer> tags.
-- End with a codetutor-memory fenced block for durable architecture notes only."))
-     "\n\n")))
-
-(defun codetutor--normalize-tool-calls (tool-calls)
-  "Return TOOL-CALLS (parsed list) as a clean vector for re-serialization."
-  (vconcat
-   (mapcar
-    (lambda (tc)
-      (let ((fn (alist-get 'function tc)))
-        `((id . ,(alist-get 'id tc))
-          (type . "function")
-          (function . ((name . ,(alist-get 'name fn))
-                       (arguments . ,(or (alist-get 'arguments fn) "{}")))))))
-    tool-calls)))
-
-(defun codetutor--parse-tool-arguments (args-string)
-  "Parse a tool-call ARGS-STRING (JSON) into an alist, or nil."
-  (if (or (null args-string)
-          (string-empty-p (string-trim args-string)))
-      nil
-    (condition-case nil
-        (json-parse-string args-string :object-type 'alist :array-type 'list)
-      (error nil))))
-
-(defun codetutor--fireworks-agent-body (model messages tool-choice)
-  "Serialize a Fireworks chat-completions body with MESSAGES, tools, TOOL-CHOICE."
-  (json-serialize
-   `((model . ,model)
-     (messages . ,(vconcat messages))
-     (tools . ,(codetutor--tool-specs))
-     (tool_choice . ,tool-choice)
-     (max_tokens . ,codetutor-fireworks-max-tokens)
-     (temperature . ,codetutor-fireworks-temperature))))
-
-(defun codetutor--fireworks-agent-start (root kind title panel user-request file diff)
-  "Begin an agentic Fireworks request for ROOT; return the first process or nil."
-  (let ((api-key (codetutor--fireworks-api-key)))
-    (if (null api-key)
-        (codetutor--render-result
-         panel root title
-         (concat "No Fireworks AI API key is available. Set "
-                 "`codetutor-fireworks-api-key', the FIREWORKS_API_KEY environment "
-                 "variable, or an auth-source entry for host `api.fireworks.ai'."))
-      (let* ((seed (codetutor--build-agent-seed-prompt
-                    kind :root root :file file :diff diff
-                    :user-request user-request))
-             (ctx (list :current-file-context
-                        (codetutor--current-file-context (or file buffer-file-name))))
-             (messages (list `((role . "system") (content . ,codetutor-system-prompt))
-                             `((role . "user") (content . ,seed))))
-             (state (list :root root :kind kind :title title :panel panel
-                          :user-request user-request
-                          :api-key api-key
-                          :ctx ctx
-                          :messages messages
-                          :iteration 0
-                          :tool-calls 0
-                          :prompt-tokens 0
-                          :completion-tokens 0)))
-        (codetutor--render-status panel root title "Fireworks AI" kind)
-        (codetutor--fireworks-agent-step state)))))
-
-(defun codetutor--fireworks-agent-step (state)
-  "Send one Fireworks request for STATE; return the process."
-  (let* ((root (plist-get state :root))
-         (session (codetutor--session root))
-         (model (or codetutor-model codetutor-fireworks-model))
-         (endpoint (concat (string-remove-suffix "/" codetutor-fireworks-api-base)
-                           "/chat/completions"))
-         (tool-choice (if (>= (plist-get state :iteration)
-                              codetutor-fireworks-max-tool-iterations)
-                          "none" "auto"))
-         (config-file (make-temp-file "codetutor-fireworks-config-"))
-         (body-file (make-temp-file "codetutor-fireworks-body-" nil ".json"))
-         (body (codetutor--fireworks-agent-body
-                model (plist-get state :messages) tool-choice))
-         (process-buffer (generate-new-buffer " *codetutor-process*")))
-    (let ((coding-system-for-write 'utf-8-unix))
-      (write-region (codetutor--fireworks-curl-config (plist-get state :api-key))
-                    nil config-file nil 'silent)
-      (write-region body nil body-file nil 'silent))
-    (let ((process
-           (make-process
-            :name "codetutor"
-            :buffer process-buffer
-            :connection-type 'pipe
-            :coding 'utf-8
-            :noquery t
-            :command (list codetutor-fireworks-command
-                           "--silent" "--show-error" "--fail-with-body"
-                           "--config" config-file
-                           "--header" "Content-Type: application/json"
-                           "--data" (concat "@" body-file)
-                           endpoint)
-            :sentinel
-            (lambda (proc _event)
-              (unless (process-live-p proc)
-                (codetutor--fireworks-agent-handle
-                 state proc process-buffer (list config-file body-file)))))))
-      (set-process-query-on-exit-flag process nil)
-      (setf (plist-get session :process) process)
-      process)))
-
-(cl-defun codetutor--fireworks-agent-handle (state process process-buffer temp-files)
-  "Handle one Fireworks step exit for STATE: run tools and loop, or finalize."
-  (let* ((root (plist-get state :root))
-         (session (codetutor--session root))
-         (title (plist-get state :title))
-         (panel (plist-get state :panel))
-         (status (process-exit-status process))
-         (stdout (when (buffer-live-p process-buffer)
-                   (with-current-buffer process-buffer
-                     (buffer-substring-no-properties (point-min) (point-max))))))
-    (dolist (file temp-files)
-      (when (and file (file-exists-p file)) (ignore-errors (delete-file file))))
-    (when (buffer-live-p process-buffer) (kill-buffer process-buffer))
-    (when (process-get process :codetutor-canceled)
-      (cl-return-from codetutor--fireworks-agent-handle nil))
-    (when (eq (plist-get session :process) process)
-      (setf (plist-get session :process) nil))
-    (let ((data (codetutor--fireworks-parse-data stdout)))
-      (if (null data)
-          (codetutor--render-result
-           panel root title
-           (format "Fireworks request failed (status %s).\n\n%s"
-                   status
-                   (string-trim (or (codetutor--fireworks-parse-response stdout) ""))))
-        (let* ((usage (codetutor--fireworks-usage data))
-               (choice (car (alist-get 'choices data)))
-               (message (alist-get 'message choice))
-               (tool-calls (alist-get 'tool_calls message))
-               (content (alist-get 'content message)))
-          (cl-incf (plist-get state :prompt-tokens) (car usage))
-          (cl-incf (plist-get state :completion-tokens) (cdr usage))
-          (if (and tool-calls
-                   (< (plist-get state :iteration)
-                      codetutor-fireworks-max-tool-iterations))
-              (codetutor--fireworks-agent-run-tools state message tool-calls)
-            (codetutor--fireworks-agent-finalize
-             state (if (stringp content) content ""))))))))
-
-(defun codetutor--render-agent-status (state tool-calls)
-  "Render a tool-call status line in the panel for STATE."
-  (let ((panel (plist-get state :panel))
-        (root (plist-get state :root))
-        (title (plist-get state :title))
-        (names (mapconcat (lambda (tc)
-                            (alist-get 'name (alist-get 'function tc)))
-                          tool-calls ", ")))
-    (codetutor--replace
-     panel
-     (format "%sStatus: thinking\n\n## %s\n\nGathering context (round %d): %s\n"
-             (codetutor--panel-header root)
-             title
-             (1+ (plist-get state :iteration))
-             names))))
-
-(defun codetutor--fireworks-agent-run-tools (state message tool-calls)
-  "Append assistant MESSAGE + TOOL-CALLS results to STATE, then loop."
-  (let* ((root (plist-get state :root))
-         (ctx (plist-get state :ctx))
-         (content (alist-get 'content message))
-         (assistant `((role . "assistant")
-                      ,@(when (stringp content) (list (cons 'content content)))
-                      (tool_calls . ,(codetutor--normalize-tool-calls tool-calls))))
-         (tool-msgs nil))
-    (setf (plist-get state :messages)
-          (append (plist-get state :messages) (list assistant)))
-    (codetutor--render-agent-status state tool-calls)
-    (dolist (tc tool-calls)
-      (let* ((id (alist-get 'id tc))
-             (fn (alist-get 'function tc))
-             (name (alist-get 'name fn))
-             (args (codetutor--parse-tool-arguments (alist-get 'arguments fn)))
-             (result (codetutor--dispatch-tool root ctx name args)))
-        (cl-incf (plist-get state :tool-calls))
-        (push `((role . "tool") (tool_call_id . ,id) (content . ,result)) tool-msgs)))
-    (setf (plist-get state :messages)
-          (append (plist-get state :messages) (nreverse tool-msgs)))
-    (cl-incf (plist-get state :iteration))
-    (codetutor--fireworks-agent-step state)))
-
-(defun codetutor--fireworks-agent-finalize (state raw)
-  "Render RAW as the final answer for STATE and report token cost."
-  (let* ((root (plist-get state :root))
-         (session (codetutor--session root))
-         (title (plist-get state :title))
-         (panel (plist-get state :panel))
-         (answer (string-trim (codetutor--answer-text raw))))
-    (codetutor--apply-memory-updates root raw)
-    (codetutor--record-turn root (plist-get state :kind)
-                            (plist-get state :user-request) answer)
-    (codetutor--render-result panel root title answer)
-    (codetutor--report-cost session
-                            (plist-get state :prompt-tokens)
-                            (plist-get state :completion-tokens)
-                            (plist-get state :tool-calls))))
 
 (defun codetutor--read-existing-file (file)
   "Return FILE contents or an empty string when FILE does not exist."
@@ -1836,8 +730,20 @@ decoded as UTF-8, so multibyte characters are not left as raw bytes."
       (walk root))
     result))
 
-(defun codetutor--current-file-context (file)
-  "Return context for FILE and the current buffer."
+(defun codetutor--numbered-buffer-text ()
+  "Return the current buffer's text with a 1-based line-number prefix per line."
+  (let ((lines (split-string (buffer-substring-no-properties (point-min) (point-max))
+                             "\n"))
+        (n 0))
+    (mapconcat (lambda (line)
+                 (setq n (1+ n))
+                 (format "%d| %s" n line))
+               lines "\n")))
+
+(defun codetutor--current-file-context (file &optional numbered)
+  "Return context for FILE and the current buffer.
+When NUMBERED is non-nil, the buffer text is shown with line-number prefixes
+so callers (e.g. inline tips) can target lines reliably."
   (string-join
    (delq
     nil
@@ -1854,7 +760,9 @@ decoded as UTF-8, so multibyte characters are not left as raw bytes."
                  " (truncated)"
                "")
              (codetutor--truncate
-              (buffer-substring-no-properties (point-min) (point-max))
+              (if numbered
+                  (codetutor--numbered-buffer-text)
+                (buffer-substring-no-properties (point-min) (point-max)))
               codetutor-max-current-file-bytes))))
    "\n\n"))
 
@@ -2241,11 +1149,21 @@ edited is identified and named."
 - Be tight and practical: they are mid-build, not reading an essay."
   "Teach-only posture for scratch (thoughts) requests.")
 
+(defconst codetutor--inline-tips-instruction
+  "INLINE TIPS MODE (teach-only):
+- The user wants short teaching annotations placed directly on lines of the current code file.
+- Read the file first with read_current_file (it returns line-numbered text) before annotating.
+- For each teaching point, call annotate_line with the 1-based line number and a 1-3 sentence tip. Favor concepts, risks, naming, design tradeoffs, and edge cases over restating the code.
+- Annotate only the most valuable lines: at least 3 and at most 8. Do not annotate every line.
+- Never write replacement code. After placing the tips, give a short one-paragraph summary of the themes as your final answer."
+  "Teach-only posture for inline-tips requests.")
+
 (defun codetutor--kind-instruction (kind)
   "Return the teach-only posture instruction for request KIND, or nil."
   (pcase kind
     ((or 'spec 'spec-implement) (codetutor--spec-instruction kind))
     ('scratch codetutor--scratch-instruction)
+    ('inline-tips codetutor--inline-tips-instruction)
     (_ nil)))
 
 (defun codetutor--save-request (kind touched)

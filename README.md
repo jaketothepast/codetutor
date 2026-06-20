@@ -1,6 +1,6 @@
 # CodeTutor
 
-CodeTutor is an Emacs package for learning while you code. It opens a right-side tutor panel, watches file saves, gathers project context, and asks a local AI assistant to respond like a senior/staff engineer pair-programming tutor.
+CodeTutor is an Emacs package for learning while you code. It opens a tutor panel (docked along the bottom of the frame by default; see `codetutor-panel-side`), watches file saves, gathers project context, and asks a local AI assistant to respond like a senior/staff engineer pair-programming tutor.
 
 The important boundary: CodeTutor helps you write the code. It does not write into your project files for you.
 
@@ -99,6 +99,8 @@ Restart Emacs after syncing.
 | `codetutor-open-spec` | `C-c t S` | Opens an existing spec as the active spec. |
 | `codetutor-finish-spec` | none | Clears the active spec. |
 | `codetutor-scratch` | `C-c t t` | Opens the scratch buffer to think out loud while building. |
+| `codetutor-inline-tips` | `C-c t i` | Annotates the focused code buffer with inline teaching tips. |
+| `codetutor-clear-inline-tips` | none | Removes inline tips from the current buffer. |
 
 ## How It Works
 
@@ -109,7 +111,7 @@ CodeTutor has four core loops: startup assessment, save review, manual prompt, a
 When you run `M-x codetutor-open`, CodeTutor:
 
 1. Detects the project root.
-2. Opens a right-side panel.
+2. Opens the tutor panel (docked at the bottom by default; `codetutor-panel-side` can switch it to a right side window).
 3. Gathers project context.
 4. Starts a read-only backend request.
 5. Replaces the panel with `Status: thinking`.
@@ -167,6 +169,14 @@ The follow-up still includes current file and project context, so the tutor can 
 `M-x codetutor-what-next` asks the tutor to inspect available context and recommend one best next step.
 
 This is useful when you are between implementation slices and want a senior engineer's judgment on what to do next.
+
+### Inline tips
+
+`M-x codetutor-inline-tips` (`C-c t i`) asks the tutor to read the **focused code buffer** and place short teaching annotations directly on specific lines — concepts, risks, naming, tradeoffs, and edge cases rather than restating the code. The model chooses which lines to annotate and what each says by calling the `annotate_line` tool, between three and eight times.
+
+The tips are rendered as **virtual lines** (overlay `after-string`), so they are display-only: you cannot edit them, they never change the file or mark the buffer modified, and nothing is written to disk. They clear on your first edit of the buffer (so stale line numbers can't mislead) and on `M-x codetutor-clear-inline-tips`.
+
+Inline tips run only on real code files — not spec documents, the scratch buffer, or the tutor panel — and require the **Fireworks agentic backend** (it is the only backend that can call tools). Appearance and behavior are configurable via `codetutor-inline-tip-placement` (below/above), `codetutor-inline-tip-max`, `codetutor-inline-tip-prefix`, `codetutor-inline-tip-clear-on-edit`, and the `codetutor-inline-tip-face`.
 
 ### Architecture Memory
 
@@ -297,6 +307,8 @@ By default (`codetutor-fireworks-use-tools` is `t`), the Fireworks backend does 
 | `read_current_file` | The file/buffer that triggered the request. |
 | `project_symbol_table` | A project-wide tree-sitter index of top-level symbols with file/line. |
 | `search_project` | Regex search results (`rg`, or `grep` fallback). |
+
+The toolset is filtered by request kind. The [inline tips](#inline-tips) command instead exposes a focused pair — `read_current_file` (returning line-numbered text) and `annotate_line(line, tip)`, which paints a teaching tip onto a buffer line — and withholds the broad project-wide read tools so the model stays on the focused file.
 
 The loop runs as a sequence of Fireworks calls: the model requests tools, CodeTutor executes them locally and feeds back the results, and it repeats until the model answers or hits `codetutor-fireworks-max-tool-iterations` (default 8). Every tool is **read-only and sandboxed to the project root** — paths that escape the root (via `..` or absolute paths) are refused. The model can read your project but cannot modify it; the only automatic write remains `.codetutor/ARCHITECTURE.md`.
 
@@ -573,8 +585,16 @@ rm -f codetutor.elc
 
 ## Files
 
+CodeTutor is split into modules loaded by the `codetutor.el` umbrella:
+
 ```text
-codetutor.el                 Package implementation
+codetutor.el                 Umbrella: modes, commands, request orchestration,
+                             prompt/context building, panel, spec & scratch modes
+codetutor-vars.el            Customization group, user options, and session state
+codetutor-backend.el         Backend selection, Fireworks HTTP, cost reporting
+codetutor-tools.el           Read-only agent tools, registry, symbol table
+codetutor-agent.el           Fireworks agentic tool-calling loop
+codetutor-inline-tips.el     Inline tips: overlay display and the command
 codetutor-pkg.el             Package metadata
 PROJECT.md                   Project direction consumed by CodeTutor
 spec/initial-behavior.md     Initial behavior spec
