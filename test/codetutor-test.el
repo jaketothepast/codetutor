@@ -607,4 +607,315 @@
   (should (string-match-p "SCRATCH MODE" (codetutor--kind-instruction 'scratch)))
   (should (null (codetutor--kind-instruction 'ask))))
 
+;;; Inline tips --------------------------------------------------------------
+
+(ert-deftest codetutor-tool-specs-filter-annotate-by-kind ()
+  (let ((names (lambda (kind)
+                 (mapcar (lambda (s) (alist-get 'name (alist-get 'function s)))
+                         (codetutor--tool-specs kind)))))
+    ;; annotate_line is withheld for the default and ordinary kinds...
+    (should-not (member "annotate_line" (funcall names nil)))
+    (should-not (member "annotate_line" (funcall names 'ask)))
+    (should (member "read_file" (funcall names 'ask)))
+    ;; ...and inline-tips sees only the focused allowlist.
+    (let ((tip-names (funcall names 'inline-tips)))
+      (should (member "annotate_line" tip-names))
+      (should (member "read_current_file" tip-names))
+      (should-not (member "read_file" tip-names))
+      (should-not (member "search_project" tip-names)))
+    ;; inline-tips specs still serialize as function tools with parameters.
+    (let* ((json (json-serialize (codetutor--tool-specs 'inline-tips)))
+           (parsed (json-parse-string json :object-type 'alist :array-type 'list)))
+      (dolist (spec parsed)
+        (should (equal "function" (alist-get 'type spec)))
+        (should (alist-get 'parameters (alist-get 'function spec)))))))
+
+(ert-deftest codetutor-annotate-line-places-tip-and-confirms ()
+  (let ((buf (generate-new-buffer " *codetutor-annotate*"))
+        (recorded nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codetutor--place-tip)
+                   (lambda (line text) (setq recorded (list line text)) 'ov)))
+          (with-current-buffer buf (insert "a\nb\nc\nd\ne\n"))
+          (let* ((tick (with-current-buffer buf (buffer-chars-modified-tick)))
+                 (ctx (list :target-buffer buf :target-file nil :target-tick tick))
+                 (result (codetutor--tool-annotate-line
+                          nil ctx '((line . 3) (tip . "Watch the boundary.")))))
+            (should (equal result "Placed tip on line 3."))
+            (should (equal recorded '(3 "Watch the boundary.")))))
+      (kill-buffer buf))))
+
+(ert-deftest codetutor-annotate-line-rejects-out-of-range ()
+  (let ((buf (generate-new-buffer " *codetutor-oor*"))
+        (called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codetutor--place-tip)
+                   (lambda (&rest _) (setq called t))))
+          (with-current-buffer buf (insert "a\nb\nc\n"))
+          (let ((ctx (list :target-buffer buf :target-file nil
+                           :target-tick (with-current-buffer buf
+                                          (buffer-chars-modified-tick)))))
+            (should (string-match-p
+                     "out of range"
+                     (codetutor--tool-annotate-line nil ctx '((line . 999) (tip . "x")))))
+            (should (string-match-p
+                     "out of range"
+                     (codetutor--tool-annotate-line nil ctx '((line . 0) (tip . "x")))))
+            (should (string-match-p
+                     "integer"
+                     (codetutor--tool-annotate-line nil ctx '((line . "3") (tip . "x")))))
+            (should-not called)))
+      (kill-buffer buf))))
+
+(ert-deftest codetutor-annotate-line-handles-stale-or-missing-buffer ()
+  (cl-letf (((symbol-function 'codetutor--place-tip)
+             (lambda (&rest _) (error "place-tip must not be called here"))))
+    ;; nil target buffer
+    (should (string-match-p
+             "no live target buffer"
+             (codetutor--tool-annotate-line
+              nil '(:target-buffer nil) '((line . 1) (tip . "x")))))
+    ;; dead buffer
+    (let ((buf (generate-new-buffer " *codetutor-dead*")))
+      (kill-buffer buf)
+      (should (string-match-p
+               "no live target buffer"
+               (codetutor--tool-annotate-line
+                nil (list :target-buffer buf) '((line . 1) (tip . "x"))))))
+    ;; file changed out from under us
+    (let ((buf (generate-new-buffer " *codetutor-fmm*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf (insert "a\nb\n"))
+            (should (string-match-p
+                     "file changed"
+                     (codetutor--tool-annotate-line
+                      nil (list :target-buffer buf :target-file "/nope/other.el"
+                                :target-tick (with-current-buffer buf
+                                               (buffer-chars-modified-tick)))
+                      '((line . 1) (tip . "x"))))))
+        (kill-buffer buf)))
+    ;; buffer edited since the request began -> stale line numbers
+    (let ((buf (generate-new-buffer " *codetutor-tick*")))
+      (unwind-protect
+          (progn
+            (with-current-buffer buf (insert "a\nb\n"))
+            (should (string-match-p
+                     "stale"
+                     (codetutor--tool-annotate-line
+                      nil (list :target-buffer buf :target-file nil :target-tick -1)
+                      '((line . 1) (tip . "x"))))))
+        (kill-buffer buf)))))
+
+(ert-deftest codetutor-annotate-line-validates-tip ()
+  (let ((buf (generate-new-buffer " *codetutor-tip*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (insert "a\nb\n"))
+          (let ((ctx (list :target-buffer buf :target-file nil
+                           :target-tick (with-current-buffer buf
+                                          (buffer-chars-modified-tick)))))
+            (should (string-match-p
+                     "non-empty"
+                     (codetutor--tool-annotate-line nil ctx '((line . 1) (tip . "   ")))))
+            (should (string-match-p
+                     "non-empty"
+                     (codetutor--tool-annotate-line nil ctx '((line . 1)))))))
+      (kill-buffer buf))))
+
+(ert-deftest codetutor-place-tip-creates-display-overlay-without-modifying ()
+  (let ((buf (generate-new-buffer " *codetutor-overlay*"))
+        (codetutor-inline-tip-clear-on-edit nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert "alpha\nbeta\ngamma\n")
+          (set-buffer-modified-p nil)
+          (codetutor--place-tip 2 "Mind the invariant.")
+          (should (= 1 (length codetutor--inline-tip-overlays)))
+          (let ((ov (car codetutor--inline-tip-overlays)))
+            (should (overlay-get ov 'codetutor-inline-tip))
+            (should (string-match-p
+                     "Mind the invariant"
+                     (or (overlay-get ov 'after-string)
+                         (overlay-get ov 'before-string)))))
+          ;; display only: text unchanged and buffer not marked modified
+          (should (equal (buffer-string) "alpha\nbeta\ngamma\n"))
+          (should-not (buffer-modified-p))
+          ;; clearing removes every tagged overlay
+          (codetutor-clear-inline-tips)
+          (should (null codetutor--inline-tip-overlays))
+          (should-not (cl-some (lambda (o) (overlay-get o 'codetutor-inline-tip))
+                               (overlays-in (point-min) (point-max)))))
+      (kill-buffer buf))))
+
+(ert-deftest codetutor-place-tip-honors-max-cap ()
+  (let ((buf (generate-new-buffer " *codetutor-cap-tips*"))
+        (codetutor-inline-tip-max 2)
+        (codetutor-inline-tip-clear-on-edit nil))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert "1\n2\n3\n4\n5\n")
+          (dolist (l '(1 2 3 4))
+            (codetutor--place-tip l (format "tip %d" l)))
+          (should (= 2 (length codetutor--inline-tip-overlays))))
+      (kill-buffer buf))))
+
+(ert-deftest codetutor-inline-tips-clear-on-first-edit ()
+  (let ((buf (generate-new-buffer " *codetutor-edit-clear*"))
+        (codetutor-inline-tip-clear-on-edit t))
+    (unwind-protect
+        (with-current-buffer buf
+          (insert "a\nb\nc\n")
+          (codetutor--place-tip 2 "tip")
+          (should (= 1 (length codetutor--inline-tip-overlays)))
+          ;; the first real text edit wipes the (now potentially stale) tips
+          (goto-char (point-max))
+          (insert "d\n")
+          (should (null codetutor--inline-tip-overlays)))
+      (kill-buffer buf))))
+
+(ert-deftest codetutor-line-to-pos-clamps-out-of-range ()
+  (with-temp-buffer
+    (insert "one\ntwo\nthree\n")
+    (should (= (codetutor--line-to-pos 1 'bol) 1))
+    (should (= (codetutor--line-to-pos 999 'eol)
+               (codetutor--line-to-pos 4 'eol)))
+    (should (= (codetutor--line-to-pos 0 'bol) 1))))
+
+(ert-deftest codetutor-current-file-context-numbered-prefixes-lines ()
+  (with-temp-buffer
+    (insert "alpha\nbeta\n")
+    (let ((plain (codetutor--current-file-context nil))
+          (numbered (codetutor--current-file-context nil t)))
+      (should-not (string-match-p "1| alpha" plain))
+      (should (string-match-p "1| alpha" numbered))
+      (should (string-match-p "2| beta" numbered)))))
+
+(ert-deftest codetutor-inline-tips-posture-and-seed ()
+  (let ((root (file-name-as-directory (make-temp-file "codetutor-tips-seed-" t))))
+    (unwind-protect
+        (progn
+          (should (string-match-p "INLINE TIPS MODE"
+                                  (codetutor--kind-instruction 'inline-tips)))
+          (should (string-match-p "annotate_line"
+                                  (codetutor--kind-instruction 'inline-tips)))
+          (with-temp-buffer
+            (should (string-match-p
+                     "annotate_line"
+                     (codetutor--build-agent-seed-prompt
+                      'inline-tips :root root :user-request "go")))
+            (should-not (string-match-p
+                         "annotate_line"
+                         (codetutor--build-agent-seed-prompt
+                          'ask :root root :user-request "go")))))
+      (remhash root codetutor--sessions)
+      (delete-directory root t))))
+
+(ert-deftest codetutor-inline-tips-guard-rejects-bad-buffers ()
+  (let ((root (file-name-as-directory (make-temp-file "codetutor-tips-guard-" t))))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codetutor--project-root) (lambda () root))
+                  ((symbol-function 'codetutor--select-backend) (lambda () 'fireworks))
+                  ((symbol-function 'codetutor--display-panel) (lambda (_root) nil))
+                  ((symbol-function 'codetutor--request) (lambda (&rest _) 'requested))
+                  ((symbol-function 'codetutor-clear-inline-tips) (lambda (&rest _) nil)))
+          (let ((codetutor-fireworks-use-tools t))
+            ;; non-file buffer
+            (with-temp-buffer
+              (should-error (codetutor-inline-tips) :type 'user-error))
+            ;; scratch buffer
+            (with-temp-buffer
+              (codetutor-scratch-mode 1)
+              (should-error (codetutor-inline-tips) :type 'user-error))
+            ;; tutor panel buffer
+            (with-temp-buffer
+              (codetutor-panel-mode)
+              (should-error (codetutor-inline-tips) :type 'user-error))
+            ;; spec document buffer
+            (let ((specfile (expand-file-name "spec/x.md" root))
+                  buf)
+              (make-directory (expand-file-name "spec" root) t)
+              (write-region "# x\n" nil specfile nil 'silent)
+              (setq buf (find-file-noselect specfile))
+              (unwind-protect
+                  (with-current-buffer buf
+                    (should-error (codetutor-inline-tips) :type 'user-error))
+                (kill-buffer buf)))))
+      (remhash root codetutor--sessions)
+      (delete-directory root t))))
+
+(ert-deftest codetutor-inline-tips-requires-fireworks-agentic ()
+  (let* ((root (file-name-as-directory (make-temp-file "codetutor-tips-be-" t)))
+         (codefile (expand-file-name "main.el" root))
+         buf)
+    (unwind-protect
+        (cl-letf (((symbol-function 'codetutor--project-root) (lambda () root))
+                  ((symbol-function 'codetutor--display-panel) (lambda (_root) nil))
+                  ((symbol-function 'codetutor--request) (lambda (&rest _) 'requested))
+                  ((symbol-function 'codetutor-clear-inline-tips) (lambda (&rest _) nil)))
+          (write-region "(message \"hi\")\n" nil codefile nil 'silent)
+          (setq buf (find-file-noselect codefile))
+          (with-current-buffer buf
+            (cl-letf (((symbol-function 'codetutor--select-backend) (lambda () 'codex)))
+              (let ((codetutor-fireworks-use-tools t))
+                (should-error (codetutor-inline-tips) :type 'user-error)))
+            (cl-letf (((symbol-function 'codetutor--select-backend) (lambda () 'fireworks)))
+              (let ((codetutor-fireworks-use-tools nil))
+                (should-error (codetutor-inline-tips) :type 'user-error)))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (remhash root codetutor--sessions)
+      (delete-directory root t))))
+
+(ert-deftest codetutor-inline-tips-clears-and-targets-buffer ()
+  (let* ((root (file-name-as-directory (make-temp-file "codetutor-tips-happy-" t)))
+         (codefile (expand-file-name "main.el" root))
+         (captured nil)
+         (cleared 'unset)
+         buf)
+    (unwind-protect
+        (cl-letf (((symbol-function 'codetutor--project-root) (lambda () root))
+                  ((symbol-function 'codetutor--select-backend) (lambda () 'fireworks))
+                  ((symbol-function 'codetutor--display-panel) (lambda (_root) nil))
+                  ((symbol-function 'codetutor-clear-inline-tips)
+                   (lambda (&optional b) (setq cleared b)))
+                  ((symbol-function 'codetutor--request)
+                   (lambda (&rest args) (setq captured args) 'requested)))
+          (write-region "(message \"hi\")\n" nil codefile nil 'silent)
+          (setq buf (find-file-noselect codefile))
+          (with-current-buffer buf
+            (let ((codetutor-fireworks-use-tools t))
+              (codetutor-inline-tips)))
+          (should (eq cleared buf))
+          (should (eq (plist-get captured :target-buffer) buf))
+          (should (eq (plist-get captured :kind) 'inline-tips)))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (remhash root codetutor--sessions)
+      (delete-directory root t))))
+
+(ert-deftest codetutor-request-threads-target-buffer-into-ctx ()
+  (let* ((root (file-name-as-directory (make-temp-file "codetutor-tips-ctx-" t)))
+         (buf (generate-new-buffer " *codetutor-ctx-target*"))
+         (captured nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'codetutor--select-backend) (lambda () 'fireworks))
+                  ((symbol-function 'codetutor--fireworks-api-key) (lambda () "k"))
+                  ((symbol-function 'codetutor--render-status) (lambda (&rest _) nil))
+                  ((symbol-function 'codetutor--fireworks-agent-step)
+                   (lambda (state) (setq captured state) 'stepped)))
+          (with-current-buffer buf (insert "(defun foo ())\n"))
+          (let ((codetutor-fireworks-use-tools t))
+            (codetutor--request
+             :root root :kind 'inline-tips :title "Inline Tips" :manual t
+             :user-request "go" :prompt "ignored" :target-buffer buf))
+          (let ((ctx (plist-get captured :ctx)))
+            (should (eq (plist-get ctx :target-buffer) buf))
+            (should (equal (plist-get ctx :target-tick)
+                           (with-current-buffer buf (buffer-chars-modified-tick))))
+            (should (string-match-p "defun foo" (plist-get ctx :current-file-context)))
+            ;; inline-tips current-file context is line-numbered
+            (should (string-match-p "1| " (plist-get ctx :current-file-context)))))
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (remhash root codetutor--sessions)
+      (delete-directory root t))))
+
 ;;; codetutor-test.el ends here
